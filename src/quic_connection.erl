@@ -3529,8 +3529,20 @@ send_app_packet_internal(Payload, Frames, State) ->
 %% send behaves exactly as before apart from a single extra receive
 %% probe.
 coalesced_sends(Acc0, State0) ->
-    Sends = drain_send_msgs(Acc0, 63),
     {RevReplies, State1} =
+        coalesce_rounds(Acc0, [], State0#state{coalesce = true}, 4, 256),
+    State2 = flush_pending_packet(State1#state{coalesce = false}),
+    FlushedState = flush_dirty_timers(flush_socket_batch(State2)),
+    Replies = [{reply, F, R} || {F, R} <- lists:reverse(RevReplies), F =/= async],
+    {keep_state, FlushedState, Replies}.
+
+%% Process-then-redrain: sends that arrive while a batch is being
+%% processed join the same flush instead of waiting for the next
+%% handler pass. Bounded by rounds and a total send budget so a
+%% saturating producer cannot starve other connection events.
+coalesce_rounds(Seed, Replies0, State0, Rounds, Budget) ->
+    Sends = drain_send_msgs(Seed, min(63, Budget)),
+    {Replies, State} =
         lists:foldl(
             fun({Tag, Sid, Data, Fin}, {Rs, S}) ->
                 case do_send_data(Sid, Data, Fin, S) of
@@ -3538,13 +3550,14 @@ coalesced_sends(Acc0, State0) ->
                     {error, Reason} -> {[{Tag, {error, Reason}} | Rs], S}
                 end
             end,
-            {[], State0#state{coalesce = true}},
+            {Replies0, State0},
             Sends
         ),
-    State2 = flush_pending_packet(State1#state{coalesce = false}),
-    FlushedState = flush_dirty_timers(flush_socket_batch(State2)),
-    Replies = [{reply, F, R} || {F, R} <- lists:reverse(RevReplies), F =/= async],
-    {keep_state, FlushedState, Replies}.
+    Left = Budget - length(Sends),
+    case Rounds > 1 andalso Left > 0 andalso Sends =/= [] of
+        true -> coalesce_rounds([], Replies, State, Rounds - 1, Left);
+        false -> {Replies, State}
+    end.
 
 drain_send_msgs(Acc, 0) ->
     lists:reverse(Acc);
