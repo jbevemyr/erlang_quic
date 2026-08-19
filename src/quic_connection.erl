@@ -7087,13 +7087,27 @@ extract_contiguous_data(Buffer, Offset, Acc) ->
             %% No frame starts exactly here, but one buffered earlier may
             %% reach past this point (overlapping retransmission): deliver
             %% its undelivered tail, or stop at a genuine gap.
-            case take_covering(Buffer, Offset) of
-                {Tail, NewBuffer} ->
-                    extract_contiguous_data(
-                        NewBuffer, Offset + byte_size(Tail), <<Acc/binary, Tail/binary>>
-                    );
-                none ->
-                    {Acc, Offset, prune_delivered(Buffer, Offset)}
+            %%
+            %% Fast path first: when every buffered frame starts above
+            %% Offset (the normal shape while waiting on a hole - frames
+            %% at or below the delivered point only appear when a peer
+            %% repacketizes retransmissions), neither a covering frame
+            %% nor a prunable one can exist, and this runs on every
+            %% received packet while the buffer is non-empty. The full
+            %% fold + filter walks below cost O(buffer) fun calls plus a
+            %% map rebuild per packet.
+            case map_size(Buffer) =:= 0 orelse lists:min(maps:keys(Buffer)) > Offset of
+                true ->
+                    {Acc, Offset, Buffer};
+                false ->
+                    case take_covering(Buffer, Offset) of
+                        {Tail, NewBuffer} ->
+                            extract_contiguous_data(
+                                NewBuffer, Offset + byte_size(Tail), <<Acc/binary, Tail/binary>>
+                            );
+                        none ->
+                            {Acc, Offset, prune_delivered(Buffer, Offset)}
+                    end
             end
     end.
 
