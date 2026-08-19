@@ -45,6 +45,7 @@
 
     %% Loss detection
     detect_lost_packets/2,
+    loss_reasons/0,
     get_loss_time_and_space/1,
 
     %% RTT
@@ -342,13 +343,20 @@ maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now) ->
 -spec detect_lost_packets(loss_state(), non_neg_integer()) ->
     {loss_state(), [#sent_packet{}]}.
 detect_lost_packets(
-    #loss_state{sent_q = Q, smoothed_rtt = SRTT} = State,
+    #loss_state{sent_q = Q, smoothed_rtt = SRTT, latest_rtt = LatestRTT} = State,
     LargestAcked
 ) ->
     Now = erlang:monotonic_time(millisecond),
     SentList = queue:to_list(Q),
+    %% RFC 9002 §6.1.2: the time threshold uses max(smoothed_rtt,
+    %% latest_rtt). Using smoothed_rtt alone mass-declares in-flight
+    %% packets lost whenever the path RTT spikes faster than the EWMA
+    %% follows (receiver queueing, bufferbloat) - their ACKs are merely
+    %% late, and every spurious loss both retransmits data and collapses
+    %% the congestion window.
+    RTT = max(SRTT, LatestRTT),
     {LostPackets, SurvQ, LostBytes, _LargestLostSentTime} =
-        detect_lost_q(SentList, SRTT, LargestAcked, Now, [], queue:new(), 0, undefined),
+        detect_lost_q(SentList, RTT, LargestAcked, Now, [], queue:new(), 0, undefined),
     NewState = State#loss_state{
         sent_q = SurvQ,
         bytes_in_flight = max(0, State#loss_state.bytes_in_flight - LostBytes)
@@ -389,6 +397,7 @@ detect_lost_q(
     LossThreshold = LargestAcked - ?PACKET_THRESHOLD + 1,
     case (PN < LossThreshold) orelse ((Now - TS) > LossDelay) of
         true ->
+            count_loss_reason(PN < LossThreshold),
             NewBytes =
                 case AE of
                     true -> LostBytes + Size;
@@ -415,14 +424,39 @@ detect_lost_q(
 largest_lost_ts(undefined) -> undefined;
 largest_lost_ts({_PN, TS}) -> TS.
 
+%% Bench diagnostic: why packets were declared lost.
+count_loss_reason(ByPnThreshold) ->
+    Ref =
+        case persistent_term:get({?MODULE, loss_reasons}, undefined) of
+            undefined ->
+                R = atomics:new(2, []),
+                persistent_term:put({?MODULE, loss_reasons}, R),
+                R;
+            R ->
+                R
+        end,
+    Ix =
+        case ByPnThreshold of
+            true -> 1;
+            false -> 2
+        end,
+    atomics:add(Ref, Ix, 1).
+
+-spec loss_reasons() -> {non_neg_integer(), non_neg_integer()}.
+loss_reasons() ->
+    case persistent_term:get({?MODULE, loss_reasons}, undefined) of
+        undefined -> {0, 0};
+        Ref -> {atomics:get(Ref, 1), atomics:get(Ref, 2)}
+    end.
+
 %% @doc Get the loss time for setting timers.
 %% The queue is oldest-first, so the earliest in_flight packet is at
 %% the head; this turns the previous O(n) map fold into an O(1) head
 %% peek in the common case (head is in_flight).
 -spec get_loss_time_and_space(loss_state()) ->
     {non_neg_integer() | undefined, atom()}.
-get_loss_time_and_space(#loss_state{sent_q = Q, smoothed_rtt = SRTT}) ->
-    LossDelay = max(trunc(?TIME_THRESHOLD * SRTT), ?GRANULARITY),
+get_loss_time_and_space(#loss_state{sent_q = Q, smoothed_rtt = SRTT, latest_rtt = LatestRTT}) ->
+    LossDelay = max(trunc(?TIME_THRESHOLD * max(SRTT, LatestRTT)), ?GRANULARITY),
     case earliest_in_flight_time(queue:to_list(Q)) of
         undefined -> {undefined, initial};
         TimeSent -> {TimeSent + LossDelay, initial}

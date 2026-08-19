@@ -59,7 +59,8 @@
     info/1,
     start_client_receiver/2,
     stop_client_receiver/1,
-    set_socket/2
+    set_socket/2,
+    client_recv_drops/0
 ]).
 
 -include("quic.hrl").
@@ -710,7 +711,15 @@ stop_client_receiver(Pid) when is_pid(Pid) ->
 client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
     case socket:recvfrom(Socket, 0, [], 100) of
         {ok, {#{addr := IP, port := Port}, Data}} ->
-            Owner ! {udp, Socket, IP, Port, Data},
+            %% Tail-drop over ?MAX_CONN_RECV_QUEUE_MSGS, emulating a
+            %% bounded kernel rcvbuf (see the define for rationale).
+            case erlang:process_info(Owner, message_queue_len) of
+                {message_queue_len, QLen} when QLen > ?MAX_CONN_RECV_QUEUE_MSGS ->
+                    count_client_recv_drop(),
+                    ok;
+                _ ->
+                    Owner ! {udp, Socket, IP, Port, Data}
+            end,
             client_recv_loop(SocketState, Owner);
         {error, timeout} ->
             client_recv_loop(SocketState, Owner);
@@ -719,6 +728,26 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
         {error, Reason} ->
             ?LOG_WARNING(#{what => client_recv_loop_exit, reason => Reason}),
             ok
+    end.
+
+%% Bench diagnostic: client-receiver tail-drop counter.
+count_client_recv_drop() ->
+    Ref =
+        case persistent_term:get({?MODULE, recv_drops}, undefined) of
+            undefined ->
+                R = atomics:new(1, []),
+                persistent_term:put({?MODULE, recv_drops}, R),
+                R;
+            R ->
+                R
+        end,
+    atomics:add(Ref, 1, 1).
+
+-spec client_recv_drops() -> non_neg_integer().
+client_recv_drops() ->
+    case persistent_term:get({?MODULE, recv_drops}, undefined) of
+        undefined -> 0;
+        Ref -> atomics:get(Ref, 1)
     end.
 
 %% @doc Detect platform capabilities for GSO/GRO. Context-free wrapper that

@@ -240,6 +240,19 @@
 %% option). See the burst_budget field.
 -define(DEFAULT_MAX_BURST_PACKETS, 64).
 
+%% Max additional datagram messages drained from the mailbox in one
+%% connected-state receive pass (see drain_recv_msgs/2).
+-define(RECV_DRAIN_MAX, 64).
+
+%% Max ACK ranges retained per PN space (RFC 9000 §13.2.4 allows the
+%% receiver to limit these). Under burst loss an unbounded list
+%% fragments into hundreds of ranges, and since every outgoing ACK
+%% encodes the full list (and the peer decodes it), ACK processing
+%% cost grows O(ranges) per packet on both ends. Packets below the
+%% lowest retained range are retransmitted by the peer and dropped
+%% here as duplicates.
+-define(MAX_ACK_RANGES, 64).
+
 %% Max receive buffer size in bytes (32 MB total across all streams) - protects against malicious peers
 -define(MAX_RECV_BUFFER_BYTES, 33554432).
 
@@ -2242,47 +2255,26 @@ connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) 
     %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
     State1 = State#state{current_packet_source = {IP, Port}},
     NewState = handle_packet(Data, State1),
-    %% Clear packet source and flush
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    %% Drain any further datagrams already in the mailbox into this
+    %% pass, then flush ACKs / batches / timers once for the lot.
+    DrainedState = drain_recv_msgs(NewState, ?RECV_DRAIN_MAX),
+    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{current_packet_source = undefined},
     check_state_transition(connected, FinalState);
 %% Server receives packets from listener
 connected(info, {quic_packet, Data, RemoteAddr}, #state{role = server} = State) ->
-    %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
-    %% Clear has_non_probing_frame before processing - will be set by process_frame_track_probing
-    State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
-    %% Process packet FIRST to classify frames
-    NewState = handle_packet(Data, State1),
-    %% RFC 9000 Section 9.1: Only trigger migration if packet contains non-probing frames
-    NewState2 =
-        case NewState#state.has_non_probing_frame of
-            true -> maybe_handle_address_change(RemoteAddr, byte_size(Data), NewState);
-            false -> NewState
-        end,
-    %% Clear transient fields and flush
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState2)),
+    NewState = server_recv_pass([Data], RemoteAddr, State),
+    DrainedState = drain_recv_msgs(NewState, ?RECV_DRAIN_MAX),
+    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{
         current_packet_source = undefined, has_non_probing_frame = false
     },
     check_state_transition(connected, FinalState);
 %% Server receives batched packets from listener (GRO optimization)
 connected(info, {quic_packets, Packets, RemoteAddr}, #state{role = server} = State) ->
-    %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
-    %% Clear has_non_probing_frame before processing - will be set by process_frame_track_probing
-    State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
-    %% Process packets FIRST to classify frames
-    NewState = handle_packets_batch(Packets, State1),
-    %% RFC 9000 Section 9.1: Only trigger migration if any packet contains non-probing frames
-    NewState2 =
-        case NewState#state.has_non_probing_frame of
-            true ->
-                TotalSize = lists:sum([byte_size(P) || P <- Packets]),
-                maybe_handle_address_change(RemoteAddr, TotalSize, NewState);
-            false ->
-                NewState
-        end,
-    %% Clear transient fields and flush
-    FlushedState = flush_dirty_timers(flush_socket_batch(NewState2)),
+    NewState = server_recv_pass(Packets, RemoteAddr, State),
+    DrainedState = drain_recv_msgs(NewState, ?RECV_DRAIN_MAX),
+    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{
         current_packet_source = undefined, has_non_probing_frame = false
     },
@@ -4088,6 +4080,49 @@ handle_packets_batch([], State) ->
 handle_packets_batch([Packet | Rest], State) ->
     NewState = handle_packet_loop(Packet, State),
     handle_packets_batch(Rest, NewState).
+
+%% One server receive pass: process the packets of a listener message
+%% (source tracking, frame classification, RFC 9000 §9.1 migration
+%% check) without the per-message flushes - the caller flushes once
+%% per drain.
+server_recv_pass(Packets, RemoteAddr, State) ->
+    State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
+    NewState = handle_packets_batch(Packets, State1),
+    case NewState#state.has_non_probing_frame of
+        true ->
+            TotalSize = lists:sum([byte_size(P) || P <- Packets]),
+            maybe_handle_address_change(RemoteAddr, TotalSize, NewState);
+        false ->
+            NewState
+    end.
+
+%% Drain datagram messages already queued in the mailbox into the
+%% current receive pass, so ACK emission, socket-batch flushing and
+%% timer resets amortize over the whole train instead of running per
+%% datagram. Stops as soon as a close is initiated (the remaining
+%% messages are handled as ordinary events by the next state) or the
+%% cap is hit (bounds time away from the event loop).
+drain_recv_msgs(#state{close_reason = CR} = State, _N) when CR =/= undefined ->
+    State;
+drain_recv_msgs(State, 0) ->
+    State;
+drain_recv_msgs(#state{role = client, socket = Socket} = State, N) ->
+    receive
+        {udp, Socket, IP, Port, Data} ->
+            State1 = State#state{current_packet_source = {IP, Port}},
+            drain_recv_msgs(handle_packet(Data, State1), N - 1)
+    after 0 ->
+        State
+    end;
+drain_recv_msgs(#state{role = server} = State, N) ->
+    receive
+        {quic_packet, Data, RemoteAddr} ->
+            drain_recv_msgs(server_recv_pass([Data], RemoteAddr, State), N - 1);
+        {quic_packets, Packets, RemoteAddr} ->
+            drain_recv_msgs(server_recv_pass(Packets, RemoteAddr, State), N - 1)
+    after 0 ->
+        State
+    end.
 
 handle_packet_loop(<<>>, #state{role = client, active_n = N} = State) ->
     %% No more data to process - re-enable socket for client connections
@@ -7644,12 +7679,21 @@ update_pn_space_recv(PN, PNSpace, Now) ->
             L -> L
         end,
     %% Add to ack_ranges maintaining descending order and merging adjacent ranges
-    NewRanges = add_to_ack_ranges(PN, Ranges),
+    NewRanges = cap_ack_ranges(add_to_ack_ranges(PN, Ranges)),
     PNSpace#pn_space{
         largest_recv = NewLargest,
         recv_time = Now,
         ack_ranges = NewRanges
     }.
+
+%% Drop the lowest ranges beyond ?MAX_ACK_RANGES (list is descending).
+cap_ack_ranges([_, _ | Tail] = Ranges) when Tail =/= [] ->
+    case length(Ranges) > ?MAX_ACK_RANGES of
+        true -> lists:sublist(Ranges, ?MAX_ACK_RANGES);
+        false -> Ranges
+    end;
+cap_ack_ranges(Ranges) ->
+    Ranges.
 
 %% Add a packet number to ACK ranges, maintaining descending order by Start
 %% and merging adjacent/overlapping ranges
@@ -9775,14 +9819,25 @@ filter_reset_stream_at_data(Frames, #state{streams = Streams}) ->
 %% Send frames for retransmission with congestion control check
 send_retransmit_frames_cc([], State) ->
     State;
-send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = State) ->
+send_retransmit_frames_cc(Frames, State) ->
+    send_retransmit_frames_cc(Frames, State, normal).
+
+%% Mode `probe' (PTO) may exceed the congestion window per RFC 9002
+%% §7.5. Mode `normal' (loss retransmission) is subject to cwnd like
+%% any other send: cwnd-exempt retransmits keep pressure on the very
+%% congestion that caused the loss, and under sustained overload the
+%% retransmit traffic itself drives the drop/retransmit spiral.
+send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = State, Mode) ->
     %% Encode all frames and check size
     Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
     PacketSize = byte_size(Payload) + 50,
 
-    %% Check if CC allows sending this retransmission
-    %% Use can_send_control to allow small overage for retransmissions
-    case quic_cc:can_send_control(CCState, PacketSize) of
+    Allowed =
+        case Mode of
+            probe -> quic_cc:can_send_control(CCState, PacketSize);
+            normal -> quic_cc:can_send(CCState, PacketSize)
+        end,
+    case Allowed of
         true ->
             send_app_packet_internal(Payload, Frames, State#state{retransmits = R + 1});
         false ->
@@ -9906,7 +9961,7 @@ send_probe_packet(State) ->
     case get_oldest_unacked_frames(State) of
         {ok, Frames} ->
             %% Retransmit oldest data as probe with CC check
-            send_retransmit_frames_cc(Frames, State);
+            send_retransmit_frames_cc(Frames, State, probe);
         none ->
             %% No data to retransmit, send PING (always allowed as control)
             Payload = quic_frame:encode(ping),
