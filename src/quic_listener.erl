@@ -558,13 +558,15 @@ group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
 send_packets_to_connection(ConnPid, Packets, RemoteAddr) ->
     case erlang:process_info(ConnPid, message_queue_len) of
         {message_queue_len, QLen} when QLen > ?MAX_CONN_RECV_QUEUE_MSGS ->
-            %% Over the bound: keep one packet of the train so the peer
-            %% still gets a timely (dup-)ACK carrying the loss signal,
-            %% drop the rest - per-packet-ish drops beat losing whole
-            %% GRO trains, which fragments ACK ranges and provokes
-            %% retransmit storms.
-            count_recv_drop(length(Packets) - 1),
-            ConnPid ! {quic_packet, hd(Packets), RemoteAddr},
+            %% Over the bound: drop the whole train, like a full kernel
+            %% receive buffer would. Consecutive dropped trains then
+            %% form ONE contiguous ACK-range hole; forwarding any part
+            %% of them (e.g. a head packet per train) interleaves
+            %% received and missing PNs, fragmenting the receiver's
+            %% ack_ranges until the range cap truncates delivered
+            %% packets out of ACKs and the peer retransmits data that
+            %% arrived fine.
+            count_recv_drop(length(Packets)),
             ok;
         _ ->
             forward_packet_chunks(ConnPid, Packets, RemoteAddr)

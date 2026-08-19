@@ -90,6 +90,7 @@
     get_path_stats/1,
     %% Connection statistics (for liveness detection)
     get_stats/1,
+    range_truncations/0,
     %% 0-RTT accessors (RFC 9001 §4.6)
     has_early_keys/1,
     early_data_accepted/1,
@@ -7689,11 +7690,34 @@ update_pn_space_recv(PN, PNSpace, Now) ->
 %% Drop the lowest ranges beyond ?MAX_ACK_RANGES (list is descending).
 cap_ack_ranges([_, _ | Tail] = Ranges) when Tail =/= [] ->
     case length(Ranges) > ?MAX_ACK_RANGES of
-        true -> lists:sublist(Ranges, ?MAX_ACK_RANGES);
-        false -> Ranges
+        true ->
+            count_range_truncation(),
+            lists:sublist(Ranges, ?MAX_ACK_RANGES);
+        false ->
+            Ranges
     end;
 cap_ack_ranges(Ranges) ->
     Ranges.
+
+%% Bench diagnostic: how often the range cap actually truncates.
+count_range_truncation() ->
+    Ref =
+        case persistent_term:get({?MODULE, range_trunc}, undefined) of
+            undefined ->
+                R = atomics:new(1, []),
+                persistent_term:put({?MODULE, range_trunc}, R),
+                R;
+            R ->
+                R
+        end,
+    atomics:add(Ref, 1, 1).
+
+-spec range_truncations() -> non_neg_integer().
+range_truncations() ->
+    case persistent_term:get({?MODULE, range_trunc}, undefined) of
+        undefined -> 0;
+        Ref -> atomics:get(Ref, 1)
+    end.
 
 %% Add a packet number to ACK ranges, maintaining descending order by Start
 %% and merging adjacent/overlapping ranges

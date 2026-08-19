@@ -709,8 +709,11 @@ stop_client_receiver(Pid) when is_pid(Pid) ->
 %% exit signals from the linked owner are processed promptly rather
 %% than blocking forever in the NIF.
 client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
-    case socket:recvfrom(Socket, 0, [], 100) of
-        {ok, {#{addr := IP, port := Port}, Data}} ->
+    %% recv_gro splits GRO-coalesced trains and sizes the read buffer
+    %% for a maximal train; a plain recvfrom with the default 8 KiB
+    %% buffer would silently truncate coalesced input.
+    case recv_gro(Socket, 100) of
+        {ok, {IP, Port}, Packets} ->
             %% Tail-drop over ?MAX_CONN_RECV_QUEUE_MSGS, emulating a
             %% bounded kernel rcvbuf (see the define for rationale).
             case erlang:process_info(Owner, message_queue_len) of
@@ -718,7 +721,8 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
                     count_client_recv_drop(),
                     ok;
                 _ ->
-                    Owner ! {udp, Socket, IP, Port, Data}
+                    [Owner ! {udp, Socket, IP, Port, Data} || Data <- Packets],
+                    ok
             end,
             client_recv_loop(SocketState, Owner);
         {error, timeout} ->
@@ -1255,8 +1259,11 @@ extra_socket_family(Extra) ->
 %%====================================================================
 
 recv_gro(Socket, Timeout) ->
-    %% Receive with GRO - may get coalesced packets
-    case socket:recvmsg(Socket, 0, 128, [], Timeout) of
+    %% Receive with GRO - may get coalesced packets. The buffer must
+    %% hold a maximally coalesced train (64 KiB): passing 0 uses the
+    %% OTP default read buffer (8 KiB) and recvmsg silently TRUNCATES
+    %% any larger train, discarding every segment past the first few.
+    case socket:recvmsg(Socket, 65535, 128, [], Timeout) of
         {ok, #{addr := #{addr := IP, port := Port}, iov := [Data], ctrl := Ctrl}} ->
             %% Check for GRO segment size in control messages
             case extract_gro_segment_size(Ctrl) of

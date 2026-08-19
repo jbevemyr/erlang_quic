@@ -46,6 +46,7 @@
     %% Loss detection
     detect_lost_packets/2,
     loss_reasons/0,
+    spurious_losses/0,
     get_loss_time_and_space/1,
 
     %% RTT
@@ -245,6 +246,9 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
                 ),
 
             NewState1 = maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now),
+            %% Bench diagnostic: count previously-lost-declared PNs that
+            %% this ACK now covers (spurious loss detections).
+            track_spurious(LargestAcked, AckedRanges),
 
             %% Phase 2: loss detection over the survivors from phase 1
             %% (KeptAccList is newest-first, reverse to oldest-first so
@@ -253,7 +257,7 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
             {LostList, SurvHeadQ, LostBytes, LargestLostSentTime} =
                 detect_lost_q(
                     KeptList,
-                    NewState1#loss_state.smoothed_rtt,
+                    max(NewState1#loss_state.smoothed_rtt, NewState1#loss_state.latest_rtt),
                     LargestAcked,
                     Now,
                     [],
@@ -262,6 +266,7 @@ on_ack_received(State, {ack, LargestAcked, AckDelay, FirstRange, AckRanges}, Now
                     undefined
                 ),
 
+            record_lost_pns(LostList),
             %% Phase 3: stitch survivors back together with the untouched
             %% tail (packets with PN > LargestAcked).
             NewQ = queue:join(SurvHeadQ, TailQ),
@@ -423,6 +428,71 @@ detect_lost_q(
 
 largest_lost_ts(undefined) -> undefined;
 largest_lost_ts({_PN, TS}) -> TS.
+
+%% Bench diagnostic (process-dict based, per connection process):
+%% record PNs declared lost; when a later ACK covers one, count it as
+%% a spurious loss detection.
+record_lost_pns(LostList) ->
+    Set = erlang:get(bench_lost_pns),
+    Set1 =
+        case Set of
+            undefined -> gb_sets:new();
+            _ -> Set
+        end,
+    erlang:put(
+        bench_lost_pns,
+        lists:foldl(fun(#sent_packet{pn = PN}, S) -> gb_sets:add(PN, S) end, Set1, LostList)
+    ),
+    ok.
+
+track_spurious(LargestAcked, AckedRanges) ->
+    case erlang:get(bench_lost_pns) of
+        undefined ->
+            ok;
+        Set ->
+            {Checked, Rest} = split_lost_below(Set, LargestAcked),
+            Spurious = [PN || PN <- Checked, pn_in_ranges(PN, AckedRanges)],
+            case Spurious of
+                [] -> ok;
+                _ -> count_spurious(length(Spurious))
+            end,
+            erlang:put(bench_lost_pns, Rest),
+            ok
+    end.
+
+split_lost_below(Set, Bound) ->
+    split_lost_below(Set, Bound, []).
+
+split_lost_below(Set, Bound, Acc) ->
+    case gb_sets:is_empty(Set) of
+        true ->
+            {Acc, Set};
+        false ->
+            {Min, Rest} = gb_sets:take_smallest(Set),
+            case Min =< Bound of
+                true -> split_lost_below(Rest, Bound, [Min | Acc]);
+                false -> {Acc, Set}
+            end
+    end.
+
+count_spurious(N) ->
+    Ref =
+        case persistent_term:get({?MODULE, spurious}, undefined) of
+            undefined ->
+                R = atomics:new(1, []),
+                persistent_term:put({?MODULE, spurious}, R),
+                R;
+            R ->
+                R
+        end,
+    atomics:add(Ref, 1, N).
+
+-spec spurious_losses() -> non_neg_integer().
+spurious_losses() ->
+    case persistent_term:get({?MODULE, spurious}, undefined) of
+        undefined -> 0;
+        Ref -> atomics:get(Ref, 1)
+    end.
 
 %% Bench diagnostic: why packets were declared lost.
 count_loss_reason(ByPnThreshold) ->
