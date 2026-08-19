@@ -270,23 +270,6 @@
 -define(AEAD_CONFIDENTIALITY_LIMIT, 16#800000).
 
 %% Connection state record
-%% Per-run constants for the bulk chunk-run sender (see
-%% send_stream_chunk_run/8); everything that would otherwise be
-%% re-extracted from #state{} on every packet of the run.
--record(chunk_run, {
-    stream_id :: non_neg_integer(),
-    max_chunk :: pos_integer(),
-    header_prefix :: binary(),
-    length_varint :: binary(),
-    key_phase :: 0 | 1,
-    cipher :: quic_aead:cipher(),
-    key :: binary(),
-    iv :: binary(),
-    hp :: binary(),
-    dcid :: binary(),
-    now :: integer()
-}).
-
 -record(state, {
     %% Connection identity
     scid :: binary(),
@@ -7157,21 +7140,28 @@ extract_contiguous_data(Buffer, Offset, MinBound, Acc) ->
                 false when MinBound =:= infinity ->
                     {Acc, Offset, Buffer, MinBound};
                 false ->
-                    %% Bound is at or below Offset: it may be stale (the
-                    %% true min was extracted) or real (a below-offset
-                    %% frame exists). Do the covering/prune walk, then
-                    %% recompute the exact bound once.
-                    case take_covering(Buffer, Offset) of
-                        {Tail, NewBuffer} ->
-                            extract_contiguous_data(
-                                NewBuffer,
-                                Offset + byte_size(Tail),
-                                MinBound,
-                                <<Acc/binary, Tail/binary>>
-                            );
-                        none ->
-                            Pruned = prune_delivered(Buffer, Offset),
-                            {Acc, Offset, Pruned, exact_min_key(Pruned)}
+                    %% Bound is at or below Offset: usually stale (the
+                    %% true min was just extracted). Recompute the exact
+                    %% min first - one walk; the covering/prune pass
+                    %% (three walks) only runs when a key at or below
+                    %% Offset genuinely exists (peer repacketized).
+                    ExactMin = exact_min_key(Buffer),
+                    case ExactMin > Offset of
+                        true ->
+                            {Acc, Offset, Buffer, ExactMin};
+                        false ->
+                            case take_covering(Buffer, Offset) of
+                                {Tail, NewBuffer} ->
+                                    extract_contiguous_data(
+                                        NewBuffer,
+                                        Offset + byte_size(Tail),
+                                        ExactMin,
+                                        <<Acc/binary, Tail/binary>>
+                                    );
+                                none ->
+                                    Pruned = prune_delivered(Buffer, Offset),
+                                    {Acc, Offset, Pruned, exact_min_key(Pruned)}
+                            end
                     end
             end
     end.
@@ -8876,22 +8866,37 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx, K
     #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
     KeyPhase = get_current_key_phase(State),
     Now = erlang:monotonic_time(millisecond),
-    Run = #chunk_run{
-        stream_id = StreamId,
-        max_chunk = MaxChunkSize,
-        header_prefix = HeaderPrefix,
-        length_varint = LengthVarint,
-        key_phase = KeyPhase,
-        cipher = Cipher,
-        key = Key,
-        iv = IV,
-        hp = HP,
-        dcid = DCID,
-        now = Now
-    },
-    {SS1, Loss1, CC1, Sent, Offset1, Rest} =
-        chunk_run_loop(K, Offset, Data, State, Run, SocketState, LossState, CCState, 0),
     PN0 = PNSpace#pn_space.next_pn,
+    %% Build the run's frames and QUIC-frame payloads, then seal all K
+    %% packets: one fused NIF call when available, per-packet Erlang
+    %% sealing otherwise.
+    {Frames, Payloads, Offset1, Rest} =
+        build_run_payloads(K, StreamId, Offset, Data, HeaderPrefix, LengthVarint, MaxChunkSize),
+    FirstByteBase = short_header_first_byte(KeyPhase, 1, State),
+    Packets =
+        case quic_aead_ctx:protect_run(Cipher, Key, IV, HP, PN0, FirstByteBase, DCID, Payloads) of
+            {ok, Ps} ->
+                Ps;
+            fallback ->
+                {Ps, _} = lists:mapfoldl(
+                    fun(Payload, PN) ->
+                        FirstByte = short_header_first_byte(
+                            KeyPhase, quic_packet:pn_length(PN), State
+                        ),
+                        {
+                            quic_aead:protect_short_packet(
+                                Cipher, Key, IV, HP, PN, FirstByte, DCID, Payload
+                            ),
+                            PN + 1
+                        }
+                    end,
+                    PN0,
+                    Payloads
+                ),
+                Ps
+        end,
+    {SS1, Loss1, CC1, Sent} =
+        send_run_packets(Packets, Frames, PN0, State, SocketState, LossState, CCState, Now, 0),
     RestartIdle = not State#state.ack_eliciting_since_recv,
     State1 = State#state{
         pn_app = PNSpace#pn_space{next_pn = PN0 + K},
@@ -8914,39 +8919,35 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx, K
         StreamId, Offset1, Rest, Fin, State2, BytesSentSoFar + K * MaxChunkSize, Ctx
     ).
 
-%% Per-chunk inner loop: seal + batch-send only; all shared state is
-%% threaded explicitly so no #state{} copy happens per packet. The PN
-%% for chunk I is taken from the loss-tracked count implicitly: the
-%% caller advances next_pn by K afterwards, and we compute each PN
-%% from the starting state via the loss fold order.
-chunk_run_loop(0, Offset, Data, _State, _Run, SS, Loss, CC, Sent) ->
-    {SS, Loss, CC, Sent, Offset, Data};
-chunk_run_loop(K, Offset, Data, State, Run, SS, Loss, CC, Sent) ->
-    #chunk_run{
-        stream_id = StreamId,
-        max_chunk = MaxChunkSize,
-        header_prefix = HeaderPrefix,
-        length_varint = LengthVarint,
-        key_phase = KeyPhase,
-        cipher = Cipher,
-        key = Key,
-        iv = IV,
-        hp = HP,
-        dcid = DCID,
-        now = Now
-    } = Run,
-    <<Chunk:MaxChunkSize/binary, Rest/binary>> = Data,
-    Frame = {stream, StreamId, Offset, Chunk, false},
+%% Split the run's data into K full chunks, building the stream frame
+%% and QUIC-frame payload for each. Returns the leftover data and its
+%% starting offset for the caller to continue with.
+build_run_payloads(K, StreamId, Offset, Data, HeaderPrefix, LengthVarint, MaxChunkSize) ->
+    build_run_payloads(K, StreamId, Offset, Data, HeaderPrefix, LengthVarint, MaxChunkSize, [], []).
+
+build_run_payloads(0, _Sid, Offset, Data, _HP, _LV, _MCS, FrAcc, PlAcc) ->
+    {lists:reverse(FrAcc), lists:reverse(PlAcc), Offset, Data};
+build_run_payloads(K, Sid, Offset, Data, HeaderPrefix, LengthVarint, MCS, FrAcc, PlAcc) ->
+    <<Chunk:MCS/binary, Rest/binary>> = Data,
+    Frame = {stream, Sid, Offset, Chunk, false},
     Payload = build_chunk_iodata(HeaderPrefix, Offset, LengthVarint, Chunk, Frame),
-    PN1 = (State#state.pn_app)#pn_space.next_pn + Sent,
-    FirstByte = short_header_first_byte(KeyPhase, quic_packet:pn_length(PN1), State),
-    Packet = quic_aead:protect_short_packet(
-        Cipher, Key, IV, HP, PN1, FirstByte, DCID, Payload
-    ),
+    build_run_payloads(
+        K - 1, Sid, Offset + MCS, Rest, HeaderPrefix, LengthVarint, MCS, [Frame | FrAcc], [
+            Payload | PlAcc
+        ]
+    ).
+
+%% Hand the run's sealed packets to the socket and track each in
+%% loss/CC state - all shared state threaded explicitly so no #state{}
+%% copy happens per packet. A failed send bumps the PN (PTO owns
+%% retransmission) without tracking, mirroring the single-packet path.
+send_run_packets([], [], _PN, _State, SS, Loss, CC, _Now, Sent) ->
+    {SS, Loss, CC, Sent};
+send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Loss, CC, Now, Sent) ->
     PacketSize = byte_size(Packet),
     ?QLOG_EMIT_PACKET_SENT(State#state.qlog_ctx, #{
         packet_type => one_rtt,
-        packet_number => PN1,
+        packet_number => PN,
         length => PacketSize,
         frames => [Frame]
     }),
@@ -8964,26 +8965,26 @@ chunk_run_loop(K, Offset, Data, State, Run, SS, Loss, CC, Sent) ->
         end,
     case SendResult of
         {ok, SS1} ->
-            Loss1 = quic_loss:on_packet_sent(Loss, PN1, PacketSize, true, [Frame], Now),
+            Loss1 = quic_loss:on_packet_sent(Loss, PN, PacketSize, true, [Frame], Now),
             CC1 = quic_cc:on_packet_sent(CC, PacketSize),
             SS2 =
                 case SS1 of
                     undefined -> SS;
                     _ -> SS1
                 end,
-            chunk_run_loop(K - 1, Offset + MaxChunkSize, Rest, State, Run, SS2, Loss1, CC1, Sent + 1);
+            send_run_packets(Pkts, Frs, PN + 1, State, SS2, Loss1, CC1, Now, Sent + 1);
         {error, Reason, SSCleared} ->
             ?LOG_WARNING(
-                #{what => udp_send_failed, reason => Reason, pn => PN1, size => PacketSize},
+                #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
                 ?QUIC_LOG_META
             ),
-            chunk_run_loop(K - 1, Offset + MaxChunkSize, Rest, State, Run, SSCleared, Loss, CC, Sent + 1);
+            send_run_packets(Pkts, Frs, PN + 1, State, SSCleared, Loss, CC, Now, Sent);
         {error, Reason} ->
             ?LOG_WARNING(
-                #{what => udp_send_failed, reason => Reason, pn => PN1, size => PacketSize},
+                #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
                 ?QUIC_LOG_META
             ),
-            chunk_run_loop(K - 1, Offset + MaxChunkSize, Rest, State, Run, SS, Loss, CC, Sent + 1)
+            send_run_packets(Pkts, Frs, PN + 1, State, SS, Loss, CC, Now, Sent)
     end.
 
 bump_key_send_count_n(undefined, _N) ->
