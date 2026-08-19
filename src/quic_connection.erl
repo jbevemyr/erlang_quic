@@ -270,6 +270,23 @@
 -define(AEAD_CONFIDENTIALITY_LIMIT, 16#800000).
 
 %% Connection state record
+%% Per-run constants for the bulk chunk-run sender (see
+%% send_stream_chunk_run/8); everything that would otherwise be
+%% re-extracted from #state{} on every packet of the run.
+-record(chunk_run, {
+    stream_id :: non_neg_integer(),
+    max_chunk :: pos_integer(),
+    header_prefix :: binary(),
+    length_varint :: binary(),
+    key_phase :: 0 | 1,
+    cipher :: quic_aead:cipher(),
+    key :: binary(),
+    iv :: binary(),
+    hp :: binary(),
+    dcid :: binary(),
+    now :: integer()
+}).
+
 -record(state, {
     %% Connection identity
     scid :: binary(),
@@ -718,6 +735,12 @@
     %% packets. The max_ack_delay timer still bounds latency; the
     %% reordering immediate-ACK path bypasses this.
     recv_pass = false :: boolean(),
+    %% Consecutive same-stream deliveries of the current receive pass,
+    %% coalesced into one pending owner message (stream id, reversed
+    %% chunk list, fin). A delivery for a DIFFERENT stream flushes the
+    %% pending one first, so the owner observes stream_data messages in
+    %% exact arrival order - only adjacent chunks of one stream merge.
+    pend_deliver = none :: none | {non_neg_integer(), [binary()], boolean()},
     ack_elicited_count = 0 :: non_neg_integer(),
     %% How many ack-eliciting 1-RTT packets to accumulate before
     %% flushing an ACK. 2 is the RFC 9000 §13.2.1 recommendation;
@@ -5140,8 +5163,11 @@ process_frame(
                 },
                 Streams
             ),
+            %% Data delivered earlier in this receive pass must reach the
+            %% owner before the reset notification.
+            StateFl = flush_pending_delivery_for(StreamId, State),
             Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-            maybe_reclaim_stream(StreamId, State#state{streams = NewStreams});
+            maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams});
         error ->
             case is_reclaimed_frame(StreamId, State) of
                 true ->
@@ -5220,9 +5246,11 @@ process_frame(
                         },
                         Streams
                     ),
-                    %% Notify owner - same message as RESET_STREAM
+                    %% Notify owner - same message as RESET_STREAM.
+                    %% Data delivered earlier in this pass goes first.
+                    StateFl = flush_pending_delivery_for(StreamId, State),
                     Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                    maybe_reclaim_stream(StreamId, State#state{streams = NewStreams});
+                    maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams});
                 error ->
                     case is_reclaimed_frame(StreamId, State) of
                         true ->
@@ -6865,17 +6893,33 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                         end,
 
                     %% Deliver contiguous data to owner
-                    %% RFC 9000: Also deliver FIN-only notification when no data but FIN received
-                    case {DeliverData, DeliverFin, Fin} of
-                        {<<>>, false, _} ->
-                            %% No contiguous data to deliver yet
-                            ok;
-                        {<<>>, true, _} ->
-                            %% FIN-only delivery (all data already delivered)
-                            Owner ! {quic, self(), {stream_data, StreamId, <<>>, true}};
-                        {_, _, _} ->
-                            Owner ! {quic, self(), {stream_data, StreamId, DeliverData, DeliverFin}}
-                    end,
+                    %% RFC 9000: Also deliver FIN-only notification when no data but FIN received.
+                    %% Inside a connected-state receive pass the delivery is
+                    %% accumulated and flushed as one message per stream at the
+                    %% end of the pass (finish_recv_pass/1); waking the owner
+                    %% once per packet dominated receiver cost on bulk flows.
+                    PendDeliver1 =
+                        case {DeliverData, DeliverFin} of
+                            {<<>>, false} ->
+                                %% No contiguous data to deliver yet
+                                State#state.pend_deliver;
+                            {_, _} when State#state.recv_pass ->
+                                accum_delivery(
+                                    Owner,
+                                    StreamId,
+                                    DeliverData,
+                                    DeliverFin,
+                                    State#state.pend_deliver
+                                );
+                            {<<>>, true} ->
+                                %% FIN-only delivery (all data already delivered)
+                                Owner ! {quic, self(), {stream_data, StreamId, <<>>, true}},
+                                State#state.pend_deliver;
+                            {_, _} ->
+                                Owner !
+                                    {quic, self(), {stream_data, StreamId, DeliverData, DeliverFin}},
+                                State#state.pend_deliver
+                        end,
 
                     NewStream = Stream#stream_state{
                         recv_offset = NewRecvOffset,
@@ -6907,7 +6951,8 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                     State1 = State#state{
                         streams = maps:put(StreamId, NewStream, Streams),
                         data_received = NewDataReceivedVal,
-                        recv_buffer_bytes = NewRecvBufferBytes
+                        recv_buffer_bytes = NewRecvBufferBytes,
+                        pend_deliver = PendDeliver1
                     },
                     %% The stream is reclaimed at the end of this clause (after the
                     %% MAX_STREAM_DATA / MAX_DATA updates, which re-put the stream),
@@ -7329,18 +7374,47 @@ maybe_decimate_app_ack(State) ->
             arm_ack_timer(State#state{ack_elicited_count = NewCount})
     end.
 
-%% End of a connected-state receive pass: emit the deferred ACK (one
-%% per train) if enough ack-eliciting packets accumulated, then clear
-%% the pass flag. Below-tolerance remainders keep their ack_timer.
-finish_recv_pass(
-    #state{ack_elicited_count = Count, ack_packet_tolerance = Tol, close_reason = undefined} =
-        State
-) when
-    Count >= Tol
-->
-    send_app_ack(State#state{recv_pass = false});
-finish_recv_pass(State) ->
-    State#state{recv_pass = false}.
+%% End of a connected-state receive pass: flush the accumulated stream
+%% deliveries (one owner message per stream), emit the deferred ACK
+%% (one per train) if enough ack-eliciting packets accumulated, then
+%% clear the pass flag. Below-tolerance remainders keep their
+%% ack_timer. Deliveries flush even when the pass initiated a close -
+%% the data arrived before it.
+finish_recv_pass(State0) ->
+    State = flush_pending_deliveries(State0),
+    case State of
+        #state{ack_elicited_count = Count, ack_packet_tolerance = Tol, close_reason = undefined} when
+            Count >= Tol
+        ->
+            send_app_ack(State#state{recv_pass = false});
+        _ ->
+            State#state{recv_pass = false}
+    end.
+
+%% Merge a delivery into the pending run when it continues the same
+%% stream; otherwise flush the pending run first (exact arrival order).
+accum_delivery(_Owner, StreamId, Data, Fin, {StreamId, Acc, F}) ->
+    {StreamId, [Data | Acc], F orelse Fin};
+accum_delivery(_Owner, StreamId, Data, Fin, none) ->
+    {StreamId, [Data], Fin};
+accum_delivery(Owner, StreamId, Data, Fin, {OtherId, Acc, F}) ->
+    Owner ! {quic, self(), {stream_data, OtherId, run_binary(Acc), F}},
+    {StreamId, [Data], Fin}.
+
+run_binary([Single]) -> Single;
+run_binary(RevChunks) -> iolist_to_binary(lists:reverse(RevChunks)).
+
+flush_pending_deliveries(#state{pend_deliver = none} = State) ->
+    State;
+flush_pending_deliveries(#state{pend_deliver = {StreamId, Acc, Fin}, owner = Owner} = State) ->
+    Owner ! {quic, self(), {stream_data, StreamId, run_binary(Acc), Fin}},
+    State#state{pend_deliver = none}.
+
+%% Flush the pending delivery run before a control message
+%% (stream_reset) is sent mid-pass, preserving data-before-control
+%% ordering.
+flush_pending_delivery_for(_StreamId, State) ->
+    flush_pending_deliveries(State).
 
 %% Arm the max_ack_delay timer if not already armed.
 arm_ack_timer(#state{ack_timer = Ref} = State) when Ref =/= undefined ->
@@ -8701,6 +8775,158 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Wh
             end
     end.
 
+%% Approve up to KMax-1 additional same-size sends against CC/pacing,
+%% consuming pacing tokens exactly as the one-at-a-time path would.
+approve_more_chunks(CC, _Size, _Urgency, _Pacing, KMax, K) when K >= KMax ->
+    {K, CC};
+approve_more_chunks(CC, Size, Urgency, Pacing, KMax, K) ->
+    Check =
+        case Pacing of
+            true -> quic_cc:send_check(CC, Size, Urgency);
+            false -> cwnd_only_check(CC, Size, Urgency)
+        end,
+    case Check of
+        {ok, CC1} -> approve_more_chunks(CC1, Size, Urgency, Pacing, KMax, K + 1);
+        _ -> {K, CC}
+    end.
+
+%% Send K CC-approved full-size chunks as one run: seal and hand each
+%% wire packet to the socket batch, then update loss/CC/PN/counters and
+%% rebuild #state{} ONCE for the whole run instead of once per packet.
+send_stream_chunk_run(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx, K) ->
+    {chunked_ctx, MaxChunkSize, _Urgency, _PacketSize, HeaderPrefix, LengthVarint, _Where} = Ctx,
+    #state{
+        dcid = DCID,
+        app_keys = {ClientKeys, ServerKeys},
+        role = Role,
+        pn_app = PNSpace,
+        loss_state = LossState,
+        cc_state = CCState,
+        socket_state = SocketState
+    } = State,
+    EncryptKeys =
+        case Role of
+            client -> ClientKeys;
+            server -> ServerKeys
+        end,
+    #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
+    KeyPhase = get_current_key_phase(State),
+    Now = erlang:monotonic_time(millisecond),
+    Run = #chunk_run{
+        stream_id = StreamId,
+        max_chunk = MaxChunkSize,
+        header_prefix = HeaderPrefix,
+        length_varint = LengthVarint,
+        key_phase = KeyPhase,
+        cipher = Cipher,
+        key = Key,
+        iv = IV,
+        hp = HP,
+        dcid = DCID,
+        now = Now
+    },
+    {SS1, Loss1, CC1, Sent, Offset1, Rest} =
+        chunk_run_loop(K, Offset, Data, State, Run, SocketState, LossState, CCState, 0),
+    PN0 = PNSpace#pn_space.next_pn,
+    RestartIdle = not State#state.ack_eliciting_since_recv,
+    State1 = State#state{
+        pn_app = PNSpace#pn_space{next_pn = PN0 + K},
+        loss_state = Loss1,
+        cc_state = CC1,
+        socket_state = SS1,
+        packets_sent = State#state.packets_sent + Sent,
+        burst_sent = State#state.burst_sent + K,
+        last_activity =
+            case RestartIdle of
+                true -> Now;
+                false -> State#state.last_activity
+            end,
+        ack_eliciting_since_recv = true,
+        pto_dirty = true,
+        key_state = bump_key_send_count_n(State#state.key_state, K)
+    },
+    State2 = maybe_force_key_update(State1),
+    send_stream_chunked_loop(
+        StreamId, Offset1, Rest, Fin, State2, BytesSentSoFar + K * MaxChunkSize, Ctx
+    ).
+
+%% Per-chunk inner loop: seal + batch-send only; all shared state is
+%% threaded explicitly so no #state{} copy happens per packet. The PN
+%% for chunk I is taken from the loss-tracked count implicitly: the
+%% caller advances next_pn by K afterwards, and we compute each PN
+%% from the starting state via the loss fold order.
+chunk_run_loop(0, Offset, Data, _State, _Run, SS, Loss, CC, Sent) ->
+    {SS, Loss, CC, Sent, Offset, Data};
+chunk_run_loop(K, Offset, Data, State, Run, SS, Loss, CC, Sent) ->
+    #chunk_run{
+        stream_id = StreamId,
+        max_chunk = MaxChunkSize,
+        header_prefix = HeaderPrefix,
+        length_varint = LengthVarint,
+        key_phase = KeyPhase,
+        cipher = Cipher,
+        key = Key,
+        iv = IV,
+        hp = HP,
+        dcid = DCID,
+        now = Now
+    } = Run,
+    <<Chunk:MaxChunkSize/binary, Rest/binary>> = Data,
+    Frame = {stream, StreamId, Offset, Chunk, false},
+    Payload = build_chunk_iodata(HeaderPrefix, Offset, LengthVarint, Chunk, Frame),
+    PN1 = (State#state.pn_app)#pn_space.next_pn + Sent,
+    FirstByte = short_header_first_byte(KeyPhase, quic_packet:pn_length(PN1), State),
+    Packet = quic_aead:protect_short_packet(
+        Cipher, Key, IV, HP, PN1, FirstByte, DCID, Payload
+    ),
+    PacketSize = byte_size(Packet),
+    ?QLOG_EMIT_PACKET_SENT(State#state.qlog_ctx, #{
+        packet_type => one_rtt,
+        packet_number => PN1,
+        length => PacketSize,
+        frames => [Frame]
+    }),
+    SendResult =
+        case SS of
+            undefined ->
+                #state{socket = Socket, remote_addr = {IP, Port}} = State,
+                case gen_udp:send(Socket, IP, Port, Packet) of
+                    ok -> {ok, undefined};
+                    {error, _} = E -> E
+                end;
+            _ ->
+                #state{remote_addr = {IP, Port}} = State,
+                quic_socket:send(SS, IP, Port, Packet)
+        end,
+    case SendResult of
+        {ok, SS1} ->
+            Loss1 = quic_loss:on_packet_sent(Loss, PN1, PacketSize, true, [Frame], Now),
+            CC1 = quic_cc:on_packet_sent(CC, PacketSize),
+            SS2 =
+                case SS1 of
+                    undefined -> SS;
+                    _ -> SS1
+                end,
+            chunk_run_loop(K - 1, Offset + MaxChunkSize, Rest, State, Run, SS2, Loss1, CC1, Sent + 1);
+        {error, Reason, SSCleared} ->
+            ?LOG_WARNING(
+                #{what => udp_send_failed, reason => Reason, pn => PN1, size => PacketSize},
+                ?QUIC_LOG_META
+            ),
+            chunk_run_loop(K - 1, Offset + MaxChunkSize, Rest, State, Run, SSCleared, Loss, CC, Sent + 1);
+        {error, Reason} ->
+            ?LOG_WARNING(
+                #{what => udp_send_failed, reason => Reason, pn => PN1, size => PacketSize},
+                ?QUIC_LOG_META
+            ),
+            chunk_run_loop(K - 1, Offset + MaxChunkSize, Rest, State, Run, SS, Loss, CC, Sent + 1)
+    end.
+
+bump_key_send_count_n(undefined, _N) ->
+    undefined;
+bump_key_send_count_n(#key_update_state{send_count = Count} = KeyState, N) ->
+    KeyState#key_update_state{send_count = Count + N}.
+
 %% Build the iodata payload `[Header, Chunk]' for a chunked stream
 %% send, reusing the pre-computed header pieces when `Offset > 0'.
 %% On the `Offset =:= 0' first-chunk path the wire format needs a
@@ -8778,7 +9004,7 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
     end.
 
 send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
-    {chunked_ctx, MaxChunkSize, Urgency, PacketSize, HeaderPrefix, LengthVarint, Where} = Ctx,
+    {chunked_ctx, MaxChunkSize, Urgency, PacketSize, _HeaderPrefix, _LengthVarint, Where} = Ctx,
     #state{cc_state = CCState, pacing_enabled = PacingEnabled} = State,
     Check =
         case PacingEnabled of
@@ -8787,20 +9013,19 @@ send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSen
         end,
     case Check of
         {ok, NewCCState} ->
-            State0 = State#state{cc_state = NewCCState},
-            <<Chunk:MaxChunkSize/binary, Rest/binary>> = Data,
-            Frame = {stream, StreamId, Offset, Chunk, false},
-            Payload = build_chunk_iodata(HeaderPrefix, Offset, LengthVarint, Chunk, Frame),
-            State1 = send_app_packet_internal(Payload, [Frame], State0),
-            send_stream_chunked_loop(
-                StreamId,
-                Offset + MaxChunkSize,
-                Rest,
-                Fin,
-                State1,
-                BytesSentSoFar + MaxChunkSize,
-                Ctx
-            );
+            %% First chunk approved. Approve as many further full
+            %% chunks as CC/pacing and the burst budget allow, then
+            %% send the whole run with one bookkeeping pass: the
+            %% per-packet #state{} rebuild in send_app_packet_now is
+            %% the largest own-time item on the bulk-send profile.
+            FullChunks = byte_size(Data) div MaxChunkSize,
+            BudgetLeft = max(1, State#state.burst_budget - State#state.burst_sent),
+            KMax = min(FullChunks, BudgetLeft),
+            {K, CCStateK} = approve_more_chunks(
+                NewCCState, PacketSize, Urgency, PacingEnabled, KMax, 1
+            ),
+            State0 = State#state{cc_state = CCStateK},
+            send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, K);
         {blocked_pacing, Delay} ->
             ?LOG_DEBUG(
                 #{
