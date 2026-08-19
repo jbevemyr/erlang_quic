@@ -46,12 +46,27 @@ load() ->
 -spec is_loaded() -> boolean().
 is_loaded() -> false.
 
-new_aead_ctx(_Cipher, _Key, _Enc) -> {error, not_loaded}.
-new_hp_ctx(_Cipher, _Key) -> {error, not_loaded}.
+%% The stubs raise (none() success typing) so dialyzer takes the specs
+%% below as the NIF return types. They are unreachable in practice:
+%% every caller gates on is_loaded/0 first.
+-spec new_aead_ctx(atom(), binary(), boolean()) -> {ok, reference()} | {error, atom()}.
+new_aead_ctx(_Cipher, _Key, _Enc) -> erlang:nif_error(not_loaded).
+-spec new_hp_ctx(atom(), binary()) -> {ok, reference()} | {error, atom()}.
+new_hp_ctx(_Cipher, _Key) -> erlang:nif_error(not_loaded).
+-spec seal(reference(), binary(), iodata(), iodata()) -> binary() | {error, atom()}.
 seal(_Ctx, _Nonce, _AAD, _Plain) -> erlang:nif_error(not_loaded).
+-spec open(reference(), binary(), iodata(), iodata(), binary()) ->
+    binary() | error | {error, atom()}.
 open(_Ctx, _Nonce, _AAD, _CipherText, _Tag) -> erlang:nif_error(not_loaded).
+-spec hp_block(reference(), binary()) -> binary() | {error, atom()}.
 hp_block(_Ctx, _Sample) -> erlang:nif_error(not_loaded).
+-spec protect_run(
+    reference(), reference(), binary(), non_neg_integer(), byte(), iodata(), [iodata()]
+) -> [binary()] | {error, atom()}.
 protect_run(_AeadCtx, _HpCtx, _IV, _PN0, _FirstByteBase, _DCID, _Payloads) ->
-    {error, not_loaded}.
+    erlang:nif_error(not_loaded).
+-spec open_packet(
+    reference(), reference(), binary(), integer(), 0 | 1, binary(), binary()
+) -> {non_neg_integer(), byte(), binary()} | error | key_phase | {error, atom()}.
 open_packet(_AeadCtx, _HpCtx, _IV, _LargestRecv, _ExpectedPhase, _Header, _EncPayload) ->
-    {error, not_loaded}.
+    erlang:nif_error(not_loaded).
