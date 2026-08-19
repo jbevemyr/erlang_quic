@@ -711,6 +711,13 @@
     %% (GSO bursts especially) before any loss signal is seen.
     burst_budget = ?DEFAULT_MAX_BURST_PACKETS :: pos_integer(),
     burst_sent = 0 :: non_neg_integer(),
+    %% True while a connected-state receive pass (first datagram plus
+    %% drained mailbox train) is being processed. Count-based ACK
+    %% decimation defers its flush to the end of the pass, so one ACK
+    %% covers the whole train instead of one per ack_packet_tolerance
+    %% packets. The max_ack_delay timer still bounds latency; the
+    %% reordering immediate-ACK path bypasses this.
+    recv_pass = false :: boolean(),
     ack_elicited_count = 0 :: non_neg_integer(),
     %% How many ack-eliciting 1-RTT packets to accumulate before
     %% flushing an ACK. 2 is the RFC 9000 §13.2.1 recommendation;
@@ -2254,18 +2261,18 @@ connected({call, From}, {migrate, _Opts}, #state{remote_addr = RemoteAddr} = Sta
     end;
 connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) ->
     %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
-    State1 = State#state{current_packet_source = {IP, Port}},
+    State1 = State#state{current_packet_source = {IP, Port}, recv_pass = true},
     NewState = handle_packet(Data, State1),
     %% Drain any further datagrams already in the mailbox into this
     %% pass, then flush ACKs / batches / timers once for the lot.
-    DrainedState = drain_recv_msgs(NewState, ?RECV_DRAIN_MAX),
+    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
     FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{current_packet_source = undefined},
     check_state_transition(connected, FinalState);
 %% Server receives packets from listener
 connected(info, {quic_packet, Data, RemoteAddr}, #state{role = server} = State) ->
-    NewState = server_recv_pass([Data], RemoteAddr, State),
-    DrainedState = drain_recv_msgs(NewState, ?RECV_DRAIN_MAX),
+    NewState = server_recv_pass([Data], RemoteAddr, State#state{recv_pass = true}),
+    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
     FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{
         current_packet_source = undefined, has_non_probing_frame = false
@@ -2273,8 +2280,8 @@ connected(info, {quic_packet, Data, RemoteAddr}, #state{role = server} = State) 
     check_state_transition(connected, FinalState);
 %% Server receives batched packets from listener (GRO optimization)
 connected(info, {quic_packets, Packets, RemoteAddr}, #state{role = server} = State) ->
-    NewState = server_recv_pass(Packets, RemoteAddr, State),
-    DrainedState = drain_recv_msgs(NewState, ?RECV_DRAIN_MAX),
+    NewState = server_recv_pass(Packets, RemoteAddr, State#state{recv_pass = true}),
+    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
     FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
     FinalState = FlushedState#state{
         current_packet_source = undefined, has_non_probing_frame = false
@@ -7294,6 +7301,10 @@ maybe_send_ack(_, _, State) ->
 %% When `?ACK_PACKET_TOLERANCE' ack-eliciting packets have been seen
 %% since the last emitted ACK, flush immediately. Otherwise increment
 %% the counter and arm a max_ack_delay timer (if not already armed).
+maybe_decimate_app_ack(#state{recv_pass = true} = State) ->
+    %% Inside a receive pass: only count; finish_recv_pass/1 flushes
+    %% one ACK for the whole train.
+    arm_ack_timer(State#state{ack_elicited_count = State#state.ack_elicited_count + 1});
 maybe_decimate_app_ack(State) ->
     NewCount = State#state.ack_elicited_count + 1,
     case NewCount >= State#state.ack_packet_tolerance of
@@ -7302,6 +7313,19 @@ maybe_decimate_app_ack(State) ->
         false ->
             arm_ack_timer(State#state{ack_elicited_count = NewCount})
     end.
+
+%% End of a connected-state receive pass: emit the deferred ACK (one
+%% per train) if enough ack-eliciting packets accumulated, then clear
+%% the pass flag. Below-tolerance remainders keep their ack_timer.
+finish_recv_pass(
+    #state{ack_elicited_count = Count, ack_packet_tolerance = Tol, close_reason = undefined} =
+        State
+) when
+    Count >= Tol
+->
+    send_app_ack(State#state{recv_pass = false});
+finish_recv_pass(State) ->
+    State#state{recv_pass = false}.
 
 %% Arm the max_ack_delay timer if not already armed.
 arm_ack_timer(#state{ack_timer = Ref} = State) when Ref =/= undefined ->
