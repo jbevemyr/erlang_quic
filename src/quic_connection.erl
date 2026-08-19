@@ -718,11 +718,18 @@
     %% packets. The max_ack_delay timer still bounds latency; the
     %% reordering immediate-ACK path bypasses this.
     recv_pass = false :: boolean(),
-    %% Consecutive same-stream deliveries of the current receive pass,
-    %% coalesced into one pending owner message (stream id, reversed
-    %% chunk list, fin). A delivery for a DIFFERENT stream flushes the
-    %% pending one first, so the owner observes stream_data messages in
-    %% exact arrival order - only adjacent chunks of one stream merge.
+    %% Opt-in (delivery_coalescing option): merge consecutive
+    %% same-stream stream_data deliveries of one receive pass into a
+    %% single owner message. QUIC gives no message-boundary guarantee,
+    %% but owners that decode each delivery as one complete
+    %% application message (rather than length-framing the byte
+    %% stream) break when deliveries merge - so the default preserves
+    %% the historical one-message-per-packet behaviour.
+    delivery_coalescing = false :: boolean(),
+    %% Pending run for the above: stream id, reversed chunk list, fin.
+    %% A delivery for a DIFFERENT stream flushes the pending one
+    %% first, so the owner observes stream_data messages in exact
+    %% arrival order - only adjacent chunks of one stream merge.
     pend_deliver = none :: none | {non_neg_integer(), [binary()], boolean()},
     ack_elicited_count = 0 :: non_neg_integer(),
     %% How many ack-eliciting 1-RTT packets to accumulate before
@@ -1237,6 +1244,7 @@ init({server, Opts}) ->
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
         ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
         burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
+        delivery_coalescing = maps:get(delivery_coalescing, Opts, false) =:= true,
         % Server-initiated bidi: 1, 5, 9, ...
         next_stream_id_bidi = 1,
         % Server-initiated uni: 3, 7, 11, ...
@@ -1621,6 +1629,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
         ack_packet_tolerance = maps:get(ack_packet_tolerance, Opts, ?ACK_PACKET_TOLERANCE),
         burst_budget = maps:get(max_burst_packets, Opts, ?DEFAULT_MAX_BURST_PACKETS),
+        delivery_coalescing = maps:get(delivery_coalescing, Opts, false) =:= true,
         % Client-initiated bidi: 0, 4, 8, ...
         next_stream_id_bidi = 0,
         % Client-initiated uni: 2, 6, 10, ...
@@ -6921,7 +6930,9 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                 %% this stays a valid lower bound.
                                 BufMin0 = min(Offset, Stream#stream_state.recv_buffer_min),
                                 {ExtractedData, ExtractedOffset, ExtractedBuffer, BufMin1} =
-                                    extract_contiguous_data(UpdatedBuffer, CurrentOffset, BufMin0, <<>>),
+                                    extract_contiguous_data(
+                                        UpdatedBuffer, CurrentOffset, BufMin0, <<>>
+                                    ),
                                 ExtractedFin =
                                     FinalSize =/= undefined andalso ExtractedOffset >= FinalSize,
                                 {ExtractedData, ExtractedOffset, ExtractedBuffer, BufMin1,
@@ -6939,7 +6950,10 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                             {<<>>, false} ->
                                 %% No contiguous data to deliver yet
                                 State#state.pend_deliver;
-                            {_, _} when State#state.recv_pass ->
+                            {_, _} when
+                                State#state.recv_pass andalso
+                                    State#state.delivery_coalescing
+                            ->
                                 accum_delivery(
                                     Owner,
                                     StreamId,
@@ -6953,7 +6967,8 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                 State#state.pend_deliver;
                             {_, _} ->
                                 Owner !
-                                    {quic, self(), {stream_data, StreamId, DeliverData, DeliverFin}},
+                                    {quic, self(),
+                                        {stream_data, StreamId, DeliverData, DeliverFin}},
                                 State#state.pend_deliver
                         end,
 
@@ -7451,7 +7466,9 @@ maybe_decimate_app_ack(State) ->
 finish_recv_pass(State0) ->
     State = flush_pending_deliveries(State0),
     case State of
-        #state{ack_elicited_count = Count, ack_packet_tolerance = Tol, close_reason = undefined} when
+        #state{
+            ack_elicited_count = Count, ack_packet_tolerance = Tol, close_reason = undefined
+        } when
             Count >= Tol
         ->
             send_app_ack(State#state{recv_pass = false});
