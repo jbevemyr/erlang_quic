@@ -586,6 +586,11 @@
     recv_fin :: boolean(),
     %% #{Offset => Data} for out-of-order reassembly
     recv_buffer :: map(),
+    %% Lower bound on the smallest offset in recv_buffer (may be stale
+    %% low after extraction; infinity when empty). Lets the per-packet
+    %% gap check skip the O(buffer) covering/prune walks without
+    %% scanning the keys.
+    recv_buffer_min = infinity :: non_neg_integer() | infinity,
     %% Our recv side is terminal: FIN read (buffer empty) or peer RESET_STREAM.
     recv_done = false :: boolean(),
 
