@@ -3863,7 +3863,8 @@ send_app_packet_now(Payload, Frames, State0) ->
                 last_activity = NewLastActivity,
                 ack_eliciting_since_recv =
                     AckEliciting orelse State#state.ack_eliciting_since_recv,
-                pto_dirty = true
+                pto_dirty = true,
+                key_state = bump_key_send_count(State#state.key_state)
             });
         {error, Reason, ClearedSocketState} ->
             send_app_packet_internal_error(
@@ -10360,18 +10361,22 @@ normalize_alpn_list(_) ->
 %% and force a key update before it is reached (RFC 9001 §6.6). Only the
 %% first over-limit packet in an idle phase triggers the update; the
 %% counter resets when the new phase begins.
-maybe_force_key_update(#state{key_state = undefined} = State) ->
-    State;
-maybe_force_key_update(#state{key_state = KeyState} = State) ->
-    NewCount = KeyState#key_update_state.send_count + 1,
-    State1 = State#state{key_state = KeyState#key_update_state{send_count = NewCount}},
-    case
-        NewCount >= ?AEAD_CONFIDENTIALITY_LIMIT andalso
-            KeyState#key_update_state.update_state =:= idle
-    of
-        true -> initiate_key_update(State1);
-        false -> State1
-    end.
+%% The send counter is bumped by the caller inside its one big #state
+%% update (bump_key_send_count/1); rebuilding the full state record a
+%% second time here just to increment a counter cost ~3% of send CPU.
+maybe_force_key_update(
+    #state{
+        key_state = #key_update_state{send_count = Count, update_state = idle}
+    } = State
+) when Count >= ?AEAD_CONFIDENTIALITY_LIMIT ->
+    initiate_key_update(State);
+maybe_force_key_update(State) ->
+    State.
+
+bump_key_send_count(undefined) ->
+    undefined;
+bump_key_send_count(#key_update_state{send_count = Count} = KeyState) ->
+    KeyState#key_update_state{send_count = Count + 1}.
 
 initiate_key_update(#state{key_state = KeyState} = State) ->
     #key_update_state{
