@@ -37,6 +37,7 @@
     on_packet_sent/4,
     on_packet_sent/5,
     on_packet_sent/6,
+    on_packets_sent_run/3,
     on_ack_received/3,
 
     %% Retransmission
@@ -212,6 +213,42 @@ on_packet_sent(
         sent_q = queue:in(SentPacket, Q),
         bytes_in_flight = NewInFlight,
         outstanding_since = OutstandingSince
+    }.
+
+%% @doc Batched on_packet_sent for a run of ack-eliciting packets sent
+%% at the same instant: one queue fold and one record update. Tracked
+%% is [{PN, Size, Frame}] in ascending PN order. Returns the updated
+%% state and the total size (for the CC in-flight update).
+-spec on_packets_sent_run(loss_state(), [{non_neg_integer(), non_neg_integer(), term()}], integer()) ->
+    {loss_state(), non_neg_integer()}.
+on_packets_sent_run(#loss_state{sent_q = Q, bytes_in_flight = InFlight} = State, Tracked, Now) ->
+    {Q1, Total} = lists:foldl(
+        fun({PN, Size, Frame}, {QAcc, TAcc}) ->
+            SentPacket = #sent_packet{
+                pn = PN,
+                time_sent = Now,
+                ack_eliciting = true,
+                in_flight = true,
+                size = Size,
+                frames = [Frame]
+            },
+            {queue:in(SentPacket, QAcc), TAcc + Size}
+        end,
+        {Q, 0},
+        Tracked
+    ),
+    OutstandingSince =
+        case InFlight =:= 0 andalso Total > 0 of
+            true -> Now;
+            false -> State#loss_state.outstanding_since
+        end,
+    {
+        State#loss_state{
+            sent_q = Q1,
+            bytes_in_flight = InFlight + Total,
+            outstanding_since = OutstandingSince
+        },
+        Total
     }.
 
 %% @doc Process an ACK frame.

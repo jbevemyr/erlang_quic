@@ -57,6 +57,8 @@
     get_pacing_tokens/2,
     pacing_delay/2,
     send_check/3,
+    send_check_run/4,
+    on_packets_sent/2,
     max_datagram_size/1,
     min_recovery_duration/1,
     ecn_ce_counter/1
@@ -811,8 +813,10 @@ update_mtu(#cc_state{max_datagram_size = OldMDS, minimum_window = OldMinWin} = S
     %% minimum_window = 2 * max_datagram_size (RFC 9002)
     NewMinimumWindow = max(2 * NewMTU, (OldMinWin * NewMTU) div OldMDS),
 
-    %% Update pacing_max_burst (12 * max_datagram_size)
-    NewPacingMaxBurst = 12 * NewMTU,
+    %% Update pacing_max_burst: at least 12 * max_datagram_size, or the
+    %% rate-scaled allowance set by update_pacing_rate, whichever is
+    %% larger (see the comment there).
+    NewPacingMaxBurst = max(12 * NewMTU, 2 * State#cc_state.pacing_rate),
 
     ?LOG_DEBUG(
         #{
@@ -904,7 +908,15 @@ update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTT) when SmoothedRTT
     %% Update HyStart++ RTT tracking
     State1 = update_hystart_rtt(State, SmoothedRTT),
 
-    State1#cc_state{pacing_rate = PacingRate};
+    %% The burst allowance must cover at least a couple of timer
+    %% granularities' worth of tokens at the paced rate: pacing wakeups
+    %% (send_after) have ~1 ms resolution, so a fixed 12-packet bucket
+    %% caps throughput at 12 packets per wakeup regardless of the rate.
+    %% 2 ms of rate keeps micro-bursts bounded (same idea as Linux fq's
+    %% pacing quantum) while letting a 1 ms clock sustain the rate.
+    MaxBurst = max(12 * State1#cc_state.max_datagram_size, 2 * PacingRate),
+
+    State1#cc_state{pacing_rate = PacingRate, pacing_max_burst = MaxBurst};
 update_pacing_rate(State, _SmoothedRTT) ->
     %% No valid RTT yet, keep current state
     State.
@@ -1032,6 +1044,75 @@ send_check(
                     DelayMs = max(1, (Deficit + Rate - 1) div Rate),
                     {blocked_pacing, DelayMs}
             end
+    end.
+
+%% @doc Batched send_check: approve up to MaxK packets of Size in one
+%% pass, consuming pacing tokens exactly as MaxK sequential send_check
+%% calls would (minus the sub-millisecond token refill between
+%% iterations, so the batch is never more permissive). Returns how many
+%% packets were approved and the updated state.
+-spec send_check_run(cc_state(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
+    {non_neg_integer(), cc_state()}.
+send_check_run(
+    #cc_state{
+        cwnd = Cwnd,
+        bytes_in_flight = InFlight,
+        control_allowance = Allowance,
+        pacing_rate = Rate
+    } = State,
+    Size,
+    MaxK,
+    Urgency
+) ->
+    CwndLimit =
+        case Urgency of
+            0 -> Cwnd + Allowance;
+            _ -> Cwnd
+        end,
+    Room = CwndLimit - InFlight,
+    KC =
+        case Room >= Size of
+            true -> min(MaxK, Room div Size);
+            false -> 0
+        end,
+    if
+        KC =< 0 ->
+            {0, State};
+        Rate =:= 0 ->
+            {KC, State};
+        true ->
+            #cc_state{
+                pacing_tokens = Tokens,
+                pacing_max_burst = MaxBurst,
+                last_pacing_update = LastUpdate
+            } = State,
+            Now = erlang:monotonic_time(microsecond),
+            Refreshed = refill_tokens_at(Tokens, MaxBurst, Rate, LastUpdate, Now),
+            KP = min(KC, Refreshed div Size),
+            case KP =< 0 of
+                true ->
+                    {0, State};
+                false ->
+                    {KP, State#cc_state{
+                        pacing_tokens = Refreshed - KP * Size,
+                        last_pacing_update = Now
+                    }}
+            end
+    end.
+
+%% @doc Batched on_packet_sent for a run of packets: one state update
+%% for the whole list of sizes.
+-spec on_packets_sent(cc_state(), [non_neg_integer()]) -> cc_state().
+on_packets_sent(State, []) ->
+    State;
+on_packets_sent(#cc_state{bytes_in_flight = InFlight} = State, Sizes) ->
+    Total = lists:sum(Sizes),
+    case State#cc_state.first_sent_time of
+        undefined ->
+            Now = erlang:monotonic_time(millisecond),
+            State#cc_state{bytes_in_flight = InFlight + Total, first_sent_time = Now};
+        _ ->
+            State#cc_state{bytes_in_flight = InFlight + Total}
     end.
 
 %%====================================================================

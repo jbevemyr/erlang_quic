@@ -9192,14 +9192,14 @@ send_stream_single_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Wh
 %% consuming pacing tokens exactly as the one-at-a-time path would.
 approve_more_chunks(CC, _Size, _Urgency, _Pacing, KMax, K) when K >= KMax ->
     {K, CC};
-approve_more_chunks(CC, Size, Urgency, Pacing, KMax, K) ->
-    Check =
-        case Pacing of
-            true -> quic_cc:send_check(CC, Size, Urgency);
-            false -> cwnd_only_check(CC, Size, Urgency)
-        end,
-    case Check of
-        {ok, CC1} -> approve_more_chunks(CC1, Size, Urgency, Pacing, KMax, K + 1);
+approve_more_chunks(CC, Size, Urgency, true, KMax, K) ->
+    %% One batched CC/pacing check for the whole run instead of a
+    %% send_check per chunk.
+    {KExtra, CC1} = quic_cc:send_check_run(CC, Size, KMax - K, Urgency),
+    {K + KExtra, CC1};
+approve_more_chunks(CC, Size, Urgency, false, KMax, K) ->
+    case cwnd_only_check(CC, Size, Urgency) of
+        {ok, CC1} -> approve_more_chunks(CC1, Size, Urgency, false, KMax, K + 1);
         _ -> {K, CC}
     end.
 
@@ -9296,13 +9296,26 @@ build_run_payloads(K, Sid, Offset, Data, HeaderPrefix, LengthVarint, MCS, FrAcc,
         ]
     ).
 
-%% Hand the run's sealed packets to the socket and track each in
-%% loss/CC state - all shared state threaded explicitly so no #state{}
-%% copy happens per packet. A failed send bumps the PN (PTO owns
-%% retransmission) without tracking, mirroring the single-packet path.
-send_run_packets([], [], _PN, _State, SS, Loss, CC, _Now, Sent) ->
-    {SS, Loss, CC, Sent};
-send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Loss, CC, Now, Sent) ->
+%% Hand the run's sealed packets to the socket, then track the
+%% successful sends in loss/CC state with ONE batched update each
+%% instead of a record rebuild per packet. A failed send bumps the PN
+%% (PTO owns retransmission) without tracking, mirroring the
+%% single-packet path.
+send_run_packets(Packets, Frames, PN0, State, SS, Loss, CC, Now, _Sent) ->
+    {SS1, TrackedRev, Sent} = send_run_sockets(Packets, Frames, PN0, State, SS, [], 0),
+    case TrackedRev of
+        [] ->
+            {SS1, Loss, CC, Sent};
+        _ ->
+            Tracked = lists:reverse(TrackedRev),
+            {Loss1, _Total} = quic_loss:on_packets_sent_run(Loss, Tracked, Now),
+            CC1 = quic_cc:on_packets_sent(CC, [Sz || {_, Sz, _} <- Tracked]),
+            {SS1, Loss1, CC1, Sent}
+    end.
+
+send_run_sockets([], [], _PN, _State, SS, Acc, Sent) ->
+    {SS, Acc, Sent};
+send_run_sockets([Packet | Pkts], [Frame | Frs], PN, State, SS, Acc, Sent) ->
     PacketSize = byte_size(Packet),
     ?QLOG_EMIT_PACKET_SENT(State#state.qlog_ctx, #{
         packet_type => one_rtt,
@@ -9324,26 +9337,26 @@ send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Loss, CC, Now, S
         end,
     case SendResult of
         {ok, SS1} ->
-            Loss1 = quic_loss:on_packet_sent(Loss, PN, PacketSize, true, [Frame], Now),
-            CC1 = quic_cc:on_packet_sent(CC, PacketSize),
             SS2 =
                 case SS1 of
                     undefined -> SS;
                     _ -> SS1
                 end,
-            send_run_packets(Pkts, Frs, PN + 1, State, SS2, Loss1, CC1, Now, Sent + 1);
+            send_run_sockets(
+                Pkts, Frs, PN + 1, State, SS2, [{PN, PacketSize, Frame} | Acc], Sent + 1
+            );
         {error, Reason, SSCleared} ->
             ?LOG_WARNING(
                 #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
                 ?QUIC_LOG_META
             ),
-            send_run_packets(Pkts, Frs, PN + 1, State, SSCleared, Loss, CC, Now, Sent);
+            send_run_sockets(Pkts, Frs, PN + 1, State, SSCleared, Acc, Sent);
         {error, Reason} ->
             ?LOG_WARNING(
                 #{what => udp_send_failed, reason => Reason, pn => PN, size => PacketSize},
                 ?QUIC_LOG_META
             ),
-            send_run_packets(Pkts, Frs, PN + 1, State, SS, Loss, CC, Now, Sent)
+            send_run_sockets(Pkts, Frs, PN + 1, State, SS, Acc, Sent)
     end.
 
 bump_key_send_count_n(undefined, _N) ->
