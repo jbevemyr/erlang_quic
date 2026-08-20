@@ -584,13 +584,12 @@
     recv_offset :: non_neg_integer(),
     recv_max_data :: non_neg_integer(),
     recv_fin :: boolean(),
-    %% #{Offset => Data} for out-of-order reassembly
-    recv_buffer :: map(),
-    %% Lower bound on the smallest offset in recv_buffer (may be stale
-    %% low after extraction; infinity when empty). Lets the per-packet
-    %% gap check skip the O(buffer) covering/prune walks without
-    %% scanning the keys.
-    recv_buffer_min = infinity :: non_neg_integer() | infinity,
+    %% Ordered Offset => Data tree for out-of-order reassembly; the
+    %% ordered structure keeps the per-packet gap check O(log n) and
+    %% bounds the covering/prune walks to keys at or below the
+    %% delivered point even with megabytes buffered during loss
+    %% recovery.
+    recv_buffer :: gb_trees:tree(non_neg_integer(), binary()),
     %% Our recv side is terminal: FIN read (buffer empty) or peer RESET_STREAM.
     recv_done = false :: boolean(),
 

@@ -2635,11 +2635,11 @@ handle_common_event(
         {Sid, SS#stream_state.send_offset, SS#stream_state.send_max_data,
             SS#stream_state.recv_offset, SS#stream_state.recv_max_data,
             case SS#stream_state.recv_buffer of
-                RB when is_map(RB), map_size(RB) > 0 ->
+                {Sz, _} = RB when Sz > 0 ->
                     {
-                        map_size(RB),
-                        lists:sum([byte_size(B) || B <- maps:values(RB)]),
-                        lists:min(maps:keys(RB))
+                        Sz,
+                        lists:sum([byte_size(B) || B <- gb_trees:values(RB)]),
+                        element(1, gb_trees:smallest(RB))
                     };
                 _ ->
                     empty
@@ -4166,11 +4166,16 @@ take_short_run(Rest, Acc) ->
 
 %% Post-decrypt processing for a batch-opened run: identical per-packet
 %% effects as the fused branch of decrypt_app_packet/4 plus the
-%% `processed' branch of handle_packet_loop/2.
-fold_opened([], State) ->
-    State;
-fold_opened([{PN, FirstByte, Plaintext} | Rest], State) ->
+%% `processed' branch of handle_packet_loop/2. One timestamp and one
+%% packets_received update cover the whole run (a train spans well
+%% under a millisecond, and nothing reads the counter mid-fold).
+fold_opened(Results, State) ->
     Now = erlang:monotonic_time(millisecond),
+    fold_opened(Results, State, Now, 0).
+
+fold_opened([], State, _Now, N) ->
+    State#state{packets_received = State#state.packets_received + N};
+fold_opened([{PN, FirstByte, Plaintext} | Rest], State, Now, N) ->
     StateF = record_app_recv(FirstByte, PN, State, Now),
     case decode_and_process_streaming(app, Plaintext, StateF) of
         {ok, NewState, Frames} ->
@@ -4178,11 +4183,8 @@ fold_opened([{PN, FirstByte, Plaintext} | Rest], State) ->
                 packet_type => app,
                 frames => Frames
             }),
-            NewState1 = NewState#state{
-                packets_received = NewState#state.packets_received + 1
-            },
-            ?QLOG_EMIT_FRAMES_PROCESSED(NewState1#state.qlog_ctx, Frames),
-            fold_opened(Rest, maybe_send_ack(app, Frames, NewState1));
+            ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
+            fold_opened(Rest, maybe_send_ack(app, Frames, NewState), Now, N + 1);
         {error, Reason} ->
             %% Same recovery as handle_packet_loop/2: log, drop the
             %% datagram, continue with the pre-packet state.
@@ -4195,7 +4197,7 @@ fold_opened([{PN, FirstByte, Plaintext} | Rest], State) ->
                 },
                 ?QUIC_LOG_META
             ),
-            fold_opened(Rest, State)
+            fold_opened(Rest, State, Now, N)
     end.
 
 %% One server receive pass: process the packets of a listener message
@@ -6922,7 +6924,7 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                     recv_offset = 0,
                     recv_max_data = InitRecvMaxData,
                     recv_fin = false,
-                    recv_buffer = #{},
+                    recv_buffer = gb_trees:empty(),
                     final_size = undefined
                 }
         end,
@@ -6934,8 +6936,8 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
     %% Check if this would exceed our receive buffer limit (malicious peer protection)
     RecvBuffer =
         case Stream#stream_state.recv_buffer of
-            B when is_map(B) -> B;
-            _ -> #{}
+            {_, _} = B -> B;
+            _ -> gb_trees:empty()
         end,
     CurrentOffset = Stream#stream_state.recv_offset,
     %% A frame only counts as duplicate when it carries nothing new: its
@@ -6945,9 +6947,9 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
     %% (senders repacketize on retransmission).
     IsDuplicate =
         EndOffset =< CurrentOffset orelse
-            (case RecvBuffer of
-                #{Offset := Dup} -> byte_size(Dup) >= DataSize;
-                _ -> false
+            (case gb_trees:lookup(Offset, RecvBuffer) of
+                {value, Dup} -> byte_size(Dup) >= DataSize;
+                none -> false
             end),
 
     %% Only check buffer limit for new (non-duplicate) data
@@ -7041,12 +7043,12 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                         end,
 
                     %% Fast path: in-order delivery with empty buffer
-                    %% Avoids maps:put and extract_contiguous_data for common case
-                    {DeliverData, NewRecvOffset, NewBuffer, NewBufMin, DeliverFin} =
-                        case Offset =:= CurrentOffset andalso map_size(RecvBuffer) =:= 0 of
+                    %% Avoids the buffer insert and extract_contiguous_data for common case
+                    {DeliverData, NewRecvOffset, NewBuffer, DeliverFin} =
+                        case Offset =:= CurrentOffset andalso gb_trees:is_empty(RecvBuffer) of
                             true ->
                                 %% In-order with empty buffer: deliver directly
-                                {Data, EndOffset, RecvBuffer, infinity, Fin};
+                                {Data, EndOffset, RecvBuffer, Fin};
                             false ->
                                 %% Out-of-order or buffer has data: use buffer path.
                                 %% Senders may repacketize on retransmission, so a
@@ -7057,17 +7059,13 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                 UpdatedBuffer = buffer_stream_data(
                                     Offset, Data, CurrentOffset, RecvBuffer
                                 ),
-                                %% Offset is =< any key the insert produced, so
-                                %% this stays a valid lower bound.
-                                BufMin0 = min(Offset, Stream#stream_state.recv_buffer_min),
-                                {ExtractedData, ExtractedOffset, ExtractedBuffer, BufMin1} =
+                                {ExtractedData, ExtractedOffset, ExtractedBuffer} =
                                     extract_contiguous_data(
-                                        UpdatedBuffer, CurrentOffset, BufMin0, <<>>
+                                        UpdatedBuffer, CurrentOffset, <<>>
                                     ),
                                 ExtractedFin =
                                     FinalSize =/= undefined andalso ExtractedOffset >= FinalSize,
-                                {ExtractedData, ExtractedOffset, ExtractedBuffer, BufMin1,
-                                    ExtractedFin}
+                                {ExtractedData, ExtractedOffset, ExtractedBuffer, ExtractedFin}
                         end,
 
                     %% Deliver contiguous data to owner
@@ -7107,10 +7105,9 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                         recv_offset = NewRecvOffset,
                         recv_fin = DeliverFin,
                         recv_buffer = NewBuffer,
-                        recv_buffer_min = NewBufMin,
                         final_size = FinalSize,
                         recv_done =
-                            (DeliverFin andalso map_size(NewBuffer) =:= 0) orelse
+                            (DeliverFin andalso gb_trees:is_empty(NewBuffer)) orelse
                                 recv_reset_at_met(Stream, NewRecvOffset) orelse
                                 Stream#stream_state.recv_done
                     },
@@ -7292,118 +7289,106 @@ buffer_stream_data(Offset, Data, CurrentOffset, Buffer) when Offset < CurrentOff
             )
     end;
 buffer_stream_data(Offset, Data, _CurrentOffset, Buffer) ->
-    case Buffer of
-        #{Offset := Existing} when byte_size(Existing) >= byte_size(Data) ->
+    case gb_trees:lookup(Offset, Buffer) of
+        {value, Existing} when byte_size(Existing) >= byte_size(Data) ->
             Buffer;
         _ ->
-            Buffer#{Offset => Data}
+            gb_trees:enter(Offset, Data, Buffer)
     end.
 
 %% Extract contiguous data from buffer starting at Offset
-%% Returns {Data, NewOffset, UpdatedBuffer, NewMinBound} where
-%% NewMinBound is a lower bound on the smallest remaining key
-%% (infinity when empty; may be stale low after plain extraction).
+%% Returns {Data, NewOffset, UpdatedBuffer}.
 %% Uses binary append accumulator - O(1) amortized due to refc binary
 %% optimization.
 %%
-%% Test-compat /2 arity without the bound threading.
+%% Test-compat /2 arity.
 -ifdef(TEST).
 extract_contiguous_data(Buffer, Offset) ->
-    {Data, NewOffset, NewBuffer, _Min} = extract_contiguous_data(Buffer, Offset, 0, <<>>),
-    {Data, NewOffset, NewBuffer}.
+    extract_contiguous_data(Buffer, Offset, <<>>).
 -endif.
 
-extract_contiguous_data(Buffer, Offset, MinBound, Acc) ->
-    case maps:take(Offset, Buffer) of
+extract_contiguous_data(Buffer, Offset, Acc) ->
+    case gb_trees:take_any(Offset, Buffer) of
         {Data, NewBuffer} ->
             %% Found data at this offset, continue looking for next chunk
             %% Binary append is O(1) amortized due to Erlang's pre-allocation
             NextOffset = Offset + byte_size(Data),
-            extract_contiguous_data(NewBuffer, NextOffset, MinBound, <<Acc/binary, Data/binary>>);
+            extract_contiguous_data(NewBuffer, NextOffset, <<Acc/binary, Data/binary>>);
         error ->
             %% No frame starts exactly here, but one buffered earlier may
             %% reach past this point (overlapping retransmission): deliver
-            %% its undelivered tail, or stop at a genuine gap.
-            %%
-            %% Fast path first: when every buffered frame starts above
-            %% Offset (the normal shape while waiting on a hole - frames
-            %% at or below the delivered point only appear when a peer
-            %% repacketizes retransmissions), neither a covering frame
-            %% nor a prunable one can exist. The maintained MinBound
-            %% makes this O(1); scanning the keys here previously cost
-            %% O(buffer) on every received packet during loss recovery.
-            case map_size(Buffer) =:= 0 of
+            %% its undelivered tail, or stop at a genuine gap. The ordered
+            %% tree makes the min lookup O(log n); the covering/prune
+            %% walks below only visit keys at or below Offset.
+            case gb_trees:is_empty(Buffer) of
                 true ->
-                    {Acc, Offset, Buffer, infinity};
-                false when is_integer(MinBound) andalso MinBound > Offset ->
-                    {Acc, Offset, Buffer, MinBound};
-                false when MinBound =:= infinity ->
-                    {Acc, Offset, Buffer, MinBound};
+                    {Acc, Offset, Buffer};
                 false ->
-                    %% Bound is at or below Offset: usually stale (the
-                    %% true min was just extracted). Recompute the exact
-                    %% min first - one walk; the covering/prune pass
-                    %% (three walks) only runs when a key at or below
-                    %% Offset genuinely exists (peer repacketized).
-                    ExactMin = exact_min_key(Buffer),
-                    case ExactMin > Offset of
+                    {MinKey, _} = gb_trees:smallest(Buffer),
+                    case MinKey > Offset of
                         true ->
-                            {Acc, Offset, Buffer, ExactMin};
+                            {Acc, Offset, Buffer};
                         false ->
                             case take_covering(Buffer, Offset) of
                                 {Tail, NewBuffer} ->
                                     extract_contiguous_data(
                                         NewBuffer,
                                         Offset + byte_size(Tail),
-                                        ExactMin,
                                         <<Acc/binary, Tail/binary>>
                                     );
                                 none ->
-                                    Pruned = prune_delivered(Buffer, Offset),
-                                    {Acc, Offset, Pruned, exact_min_key(Pruned)}
+                                    {Acc, Offset, prune_delivered(Buffer, Offset)}
                             end
                     end
             end
     end.
 
-exact_min_key(Buffer) when map_size(Buffer) =:= 0 ->
-    infinity;
-exact_min_key(Buffer) ->
-    maps:fold(fun(K, _V, Min) -> min(K, Min) end, infinity, Buffer).
-
 %% Find the buffered frame that starts at or before Offset and reaches
-%% furthest past it; return its undelivered tail.
+%% furthest past it; return its undelivered tail. Only keys at or below
+%% Offset can qualify, so the ordered walk stops there.
 take_covering(Buffer, Offset) ->
-    Best = maps:fold(
-        fun(K, V, Acc) ->
+    take_covering_iter(gb_trees:iterator(Buffer), Buffer, Offset, none).
+
+take_covering_iter(Iter0, Buffer, Offset, Best) ->
+    case gb_trees:next(Iter0) of
+        {K, V, Iter} when K =< Offset ->
             End = K + byte_size(V),
-            case K =< Offset andalso End > Offset of
-                true ->
-                    case Acc of
-                        {BK, BV} when BK + byte_size(BV) >= End -> Acc;
-                        _ -> {K, V}
-                    end;
-                false ->
-                    Acc
+            NewBest =
+                case End > Offset of
+                    true ->
+                        case Best of
+                            {BK, BV} when BK + byte_size(BV) >= End -> Best;
+                            _ -> {K, V}
+                        end;
+                    false ->
+                        Best
+                end,
+            take_covering_iter(Iter, Buffer, Offset, NewBest);
+        _ ->
+            case Best of
+                none ->
+                    none;
+                {K2, V2} ->
+                    Skip = Offset - K2,
+                    {binary:part(V2, Skip, byte_size(V2) - Skip), gb_trees:delete(K2, Buffer)}
             end
-        end,
-        none,
-        Buffer
-    ),
-    case Best of
-        none ->
-            none;
-        {K2, V2} ->
-            Skip = Offset - K2,
-            {binary:part(V2, Skip, byte_size(V2) - Skip), maps:remove(K2, Buffer)}
     end.
 
 %% Drop buffered frames whose whole range is below the delivered point
 %% (leftovers of overlapping deliveries); they can never be extracted.
+%% Only keys below Offset can qualify, so the ordered walk stops there.
 prune_delivered(Buffer, Offset) ->
-    case map_size(Buffer) of
-        0 -> Buffer;
-        _ -> maps:filter(fun(K, V) -> K + byte_size(V) > Offset end, Buffer)
+    prune_delivered_iter(gb_trees:iterator(Buffer), Buffer, Offset).
+
+prune_delivered_iter(Iter0, Buffer, Offset) ->
+    case gb_trees:next(Iter0) of
+        {K, V, Iter} when K < Offset ->
+            case K + byte_size(V) =< Offset of
+                true -> prune_delivered_iter(Iter, gb_trees:delete(K, Buffer), Offset);
+                false -> prune_delivered_iter(Iter, Buffer, Offset)
+            end;
+        _ ->
+            Buffer
     end.
 
 %% Get the maximum stream receive window across all streams.
@@ -8290,7 +8275,7 @@ do_open_stream(
                 recv_offset = 0,
                 recv_max_data = RecvMaxData,
                 recv_fin = false,
-                recv_buffer = #{},
+                recv_buffer = gb_trees:empty(),
                 final_size = undefined
             },
             NewState = State#state{
@@ -8341,7 +8326,7 @@ do_open_unidirectional_stream(
                 recv_max_data = 0,
                 % No incoming data expected
                 recv_fin = true,
-                recv_buffer = #{},
+                recv_buffer = gb_trees:empty(),
                 final_size = undefined
             },
             NewState = State#state{

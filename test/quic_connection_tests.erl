@@ -927,32 +927,35 @@ conn_max_data_growth_modes_test() ->
 %% (where exact-match extraction never looks) permanently stalls the
 %% stream once the packet is acked.
 recv_buffer_overlap_head_trim_test() ->
-    B = quic_connection:buffer_stream_data(80, binary:copy(<<"a">>, 40), 100, #{}),
-    ?assertEqual(#{100 => binary:copy(<<"a">>, 20)}, B).
+    B = quic_connection:buffer_stream_data(80, binary:copy(<<"a">>, 40), 100, gb_trees:empty()),
+    ?assertEqual([{100, binary:copy(<<"a">>, 20)}], gb_trees:to_list(B)).
 
 recv_buffer_overlap_full_duplicate_test() ->
-    ?assertEqual(#{}, quic_connection:buffer_stream_data(80, <<"aaaa">>, 100, #{})).
+    B = quic_connection:buffer_stream_data(80, <<"aaaa">>, 100, gb_trees:empty()),
+    ?assertEqual([], gb_trees:to_list(B)).
 
 recv_buffer_same_offset_longer_wins_test() ->
-    B0 = #{100 => <<"aa">>},
+    B0 = gb_trees:from_orddict([{100, <<"aa">>}]),
     B1 = quic_connection:buffer_stream_data(100, <<"aaaa">>, 90, B0),
-    ?assertEqual(#{100 => <<"aaaa">>}, B1),
+    ?assertEqual([{100, <<"aaaa">>}], gb_trees:to_list(B1)),
     B2 = quic_connection:buffer_stream_data(100, <<"a">>, 90, B1),
-    ?assertEqual(#{100 => <<"aaaa">>}, B2).
+    ?assertEqual([{100, <<"aaaa">>}], gb_trees:to_list(B2)).
 
 extract_covering_overlap_test() ->
     %% Buffered [100,200) and [150,260): contiguous extraction from 100
     %% must reach 260 even though no frame starts exactly at 200.
-    Buf = #{100 => binary:copy(<<"x">>, 100), 150 => binary:copy(<<"y">>, 110)},
+    Buf = gb_trees:from_orddict([
+        {100, binary:copy(<<"x">>, 100)}, {150, binary:copy(<<"y">>, 110)}
+    ]),
     {Data, Off, Rest} = quic_connection:extract_contiguous_data(Buf, 100),
     ?assertEqual(260, Off),
     ?assertEqual(160, byte_size(Data)),
-    ?assertEqual(#{}, Rest),
+    ?assertEqual([], gb_trees:to_list(Rest)),
     ?assertEqual(binary:copy(<<"y">>, 60), binary:part(Data, 100, 60)).
 
 extract_prunes_stale_entries_test() ->
     %% Leftovers fully below the delivered point are dropped at a genuine
     %% gap; future data stays buffered.
-    Buf = #{50 => <<"zzzz">>, 300 => <<"future">>},
+    Buf = gb_trees:from_orddict([{50, <<"zzzz">>}, {300, <<"future">>}]),
     {<<>>, 100, Rest} = quic_connection:extract_contiguous_data(Buf, 100),
-    ?assertEqual(#{300 => <<"future">>}, Rest).
+    ?assertEqual([{300, <<"future">>}], gb_trees:to_list(Rest)).
