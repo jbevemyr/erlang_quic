@@ -4171,11 +4171,104 @@ take_short_run(Rest, Acc) ->
 %% under a millisecond, and nothing reads the counter mid-fold).
 fold_opened(Results, State) ->
     Now = erlang:monotonic_time(millisecond),
-    fold_opened(Results, State, Now, 0).
+    %% Contiguous-run fast path: when the whole opened run continues the
+    %% receive sequence exactly (PNs consecutive from largest_recv + 1,
+    %% which also means the head ACK range extends in place), the
+    %% per-packet receive bookkeeping collapses into one state update:
+    %% largest/ranges/spin from the last packet, every packet classified
+    %% sequential. Any other shape takes the per-packet path unchanged.
+    case State#state.pn_app of
+        #pn_space{largest_recv = L, ack_ranges = [{RangeStart, L} | RestRanges]} = PNSpace when
+            is_integer(L)
+        ->
+            case seq_run_last(Results, L + 1) of
+                {LastPN, LastFB} ->
+                    SpinRecv = (LastFB bsr 5) band 1,
+                    SpinOut =
+                        case State#state.spin_bit_enabled of
+                            false -> State#state.spin_outgoing;
+                            true when State#state.role =:= client -> SpinRecv;
+                            true -> 1 - SpinRecv
+                        end,
+                    State1 = State#state{
+                        pn_app = PNSpace#pn_space{
+                            largest_recv = LastPN,
+                            recv_time = Now,
+                            ack_ranges = [{RangeStart, LastPN} | RestRanges]
+                        },
+                        last_recv_trigger = sequential,
+                        spin_recv = SpinRecv,
+                        spin_recv_largest_pn = LastPN,
+                        spin_outgoing = SpinOut,
+                        last_activity = Now,
+                        ack_eliciting_since_recv = false
+                    },
+                    fold_opened_seq(Results, State1, Now, 0, 0);
+                no ->
+                    fold_opened(Results, State, Now, 0, 0)
+            end;
+        _ ->
+            fold_opened(Results, State, Now, 0, 0)
+    end.
 
-fold_opened([], State, _Now, N) ->
-    State#state{packets_received = State#state.packets_received + N};
-fold_opened([{PN, FirstByte, Plaintext} | Rest], State, Now, N) ->
+%% Last {PN, FirstByte} of a run iff PNs are consecutive from Expected.
+seq_run_last([{PN, FB, _}], PN) ->
+    {PN, FB};
+seq_run_last([{PN, _, _} | [{PN2, _, _} | _] = Rest], PN) when PN2 =:= PN + 1 ->
+    seq_run_last(Rest, PN2);
+seq_run_last(_, _) ->
+    no.
+
+%% Per-packet loop for a contiguous run: receive bookkeeping already
+%% applied for the whole train, every packet known sequential.
+fold_opened_seq([], State, _Now, N, Elicited) ->
+    fold_opened_finish(State, N, Elicited);
+fold_opened_seq([{_PN, _FB, Plaintext} | Rest], State, Now, N, Elicited) ->
+    case decode_and_process_streaming(app, Plaintext, State) of
+        {ok, NewState, Frames} ->
+            ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
+                packet_type => app,
+                frames => Frames
+            }),
+            ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
+            {State2, Elicited2} =
+                case contains_ack_eliciting_frames(Frames) of
+                    false ->
+                        {NewState, Elicited};
+                    true ->
+                        case should_delay_ack(Frames) of
+                            true -> {schedule_delayed_ack(app, NewState), Elicited};
+                            false -> {NewState, Elicited + 1}
+                        end
+                end,
+            fold_opened_seq(Rest, State2, Now, N + 1, Elicited2);
+        {error, Reason} ->
+            ?LOG_WARNING(
+                #{
+                    what => packet_decode_decrypt_failed,
+                    role => State#state.role,
+                    reason => Reason,
+                    source => State#state.current_packet_source
+                },
+                ?QUIC_LOG_META
+            ),
+            fold_opened_seq(Rest, State, Now, N, Elicited)
+    end.
+
+fold_opened_finish(State, N, Elicited) ->
+    State1 = State#state{packets_received = State#state.packets_received + N},
+    case Elicited of
+        0 ->
+            State1;
+        _ ->
+            arm_ack_timer(State1#state{
+                ack_elicited_count = State1#state.ack_elicited_count + Elicited
+            })
+    end.
+
+fold_opened([], State, _Now, N, Elicited) ->
+    fold_opened_finish(State, N, Elicited);
+fold_opened([{PN, FirstByte, Plaintext} | Rest], State, Now, N, Elicited) ->
     StateF = record_app_recv(FirstByte, PN, State, Now),
     case decode_and_process_streaming(app, Plaintext, StateF) of
         {ok, NewState, Frames} ->
@@ -4184,7 +4277,31 @@ fold_opened([{PN, FirstByte, Plaintext} | Rest], State, Now, N) ->
                 frames => Frames
             }),
             ?QLOG_EMIT_FRAMES_PROCESSED(NewState#state.qlog_ctx, Frames),
-            fold_opened(Rest, maybe_send_ack(app, Frames, NewState), Now, N + 1);
+            %% Per-packet ACK policy identical to maybe_send_ack(app, ...),
+            %% except the count-based decimation increment is accumulated
+            %% across the run and applied once at the end (the runs only
+            %% exist inside a receive pass, where decimation just counts).
+            {State2, Elicited2} =
+                case contains_ack_eliciting_frames(Frames) of
+                    false ->
+                        {NewState, Elicited};
+                    true ->
+                        case should_delay_ack(Frames) of
+                            true ->
+                                {schedule_delayed_ack(app, NewState), Elicited};
+                            false ->
+                                case NewState#state.last_recv_trigger of
+                                    reordered ->
+                                        %% send_app_ack acks everything seen so
+                                        %% far and clears the count, so pending
+                                        %% increments are dropped with it.
+                                        {send_app_ack(NewState), 0};
+                                    sequential ->
+                                        {NewState, Elicited + 1}
+                                end
+                        end
+                end,
+            fold_opened(Rest, State2, Now, N + 1, Elicited2);
         {error, Reason} ->
             %% Same recovery as handle_packet_loop/2: log, drop the
             %% datagram, continue with the pre-packet state.
@@ -4197,7 +4314,7 @@ fold_opened([{PN, FirstByte, Plaintext} | Rest], State, Now, N) ->
                 },
                 ?QUIC_LOG_META
             ),
-            fold_opened(Rest, State, Now, N)
+            fold_opened(Rest, State, Now, N, Elicited)
     end.
 
 %% One server receive pass: process the packets of a listener message
@@ -6883,7 +7000,64 @@ clamp_recv_reset_at(StreamId, Offset, Data, Fin, State) ->
 recv_reset_at_met(#stream_state{recv_reset_at = R}, Off) ->
     R =/= undefined andalso Off >= R.
 
+%% Lean fast path for the dominant bulk case: existing stream, exactly
+%% in-order, empty reassembly buffer, no FIN in sight, both flow-control
+%% windows comfortably open (so no MAX_STREAM_DATA / MAX_DATA update
+%% fires). One stream-record update and one map put; everything else
+%% falls back to the general path below with identical semantics.
+do_process_stream_data_buffered(StreamId, Offset, Data, false = Fin, State) ->
+    case State#state.streams of
+        #{
+            StreamId := #stream_state{
+                recv_offset = Offset,
+                recv_max_data = RecvMaxData,
+                final_size = undefined,
+                recv_reset_at = undefined,
+                recv_buffer = RB
+            } = Stream
+        } ->
+            DataSize = byte_size(Data),
+            EndOffset = Offset + DataSize,
+            NewDataReceived = State#state.data_received + DataSize,
+            HalfWindow = State#state.fc_max_receive_window div 2,
+            case
+                DataSize > 0 andalso
+                    gb_trees:is_empty(RB) andalso
+                    RecvMaxData - EndOffset >= HalfWindow andalso
+                    State#state.max_data_local - NewDataReceived >= HalfWindow andalso
+                    State#state.recv_buffer_bytes + DataSize =< ?MAX_RECV_BUFFER_BYTES
+            of
+                true ->
+                    Owner = State#state.owner,
+                    PendDeliver =
+                        case State#state.recv_pass andalso State#state.delivery_coalescing of
+                            true ->
+                                accum_delivery(
+                                    Owner, StreamId, Data, false, State#state.pend_deliver
+                                );
+                            false ->
+                                Owner ! {quic, self(), {stream_data, StreamId, Data, false}},
+                                State#state.pend_deliver
+                        end,
+                    State#state{
+                        streams = maps:put(
+                            StreamId,
+                            Stream#stream_state{recv_offset = EndOffset},
+                            State#state.streams
+                        ),
+                        data_received = NewDataReceived,
+                        pend_deliver = PendDeliver
+                    };
+                false ->
+                    do_process_stream_data_slow(StreamId, Offset, Data, Fin, State)
+            end;
+        _ ->
+            do_process_stream_data_slow(StreamId, Offset, Data, Fin, State)
+    end;
 do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
+    do_process_stream_data_slow(StreamId, Offset, Data, Fin, State).
+
+do_process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
     #state{
         owner = Owner,
         streams = Streams,
@@ -7147,18 +7321,6 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                     MaxWindowForStream = State#state.fc_max_receive_window,
                     Headroom = max(0, RecvMaxData - NewRecvOffset),
                     WillSendMaxStreamData = Headroom < (MaxWindowForStream div 2),
-                    Threshold = RecvMaxData - (MaxWindowForStream div 2),
-                    ?LOG_DEBUG(
-                        #{
-                            what => max_stream_data_check,
-                            stream_id => StreamId,
-                            recv_offset => NewRecvOffset,
-                            recv_max_data => RecvMaxData,
-                            threshold => Threshold,
-                            will_send => WillSendMaxStreamData
-                        },
-                        ?QUIC_LOG_META
-                    ),
                     State2 =
                         case WillSendMaxStreamData of
                             true ->
@@ -7628,6 +7790,10 @@ arm_ack_timer(#state{ack_timer = undefined} = State) ->
 
 %% Per RFC 9221 Section 5.2: Delay ACKs for packets containing only
 %% non-retransmittable ack-eliciting frames (like DATAGRAM).
+should_delay_ack([{stream, _, _, _, _} | _]) ->
+    %% Hot path: a stream frame is ack-eliciting and retransmittable,
+    %% so the packet never qualifies for the datagram-only delay.
+    false;
 should_delay_ack(Frames) ->
     AckEliciting = [F || F <- Frames, is_ack_eliciting_frame(F)],
     Retransmittable = quic_loss:retransmittable_frames(AckEliciting),
@@ -7993,8 +8159,14 @@ update_pn_space_recv(PN, PNSpace, Now) ->
             L when PN > L -> PN;
             L -> L
         end,
-    %% Add to ack_ranges maintaining descending order and merging adjacent ranges
-    NewRanges = cap_ack_ranges(add_to_ack_ranges(PN, Ranges)),
+    %% Add to ack_ranges maintaining descending order and merging adjacent
+    %% ranges. A sequential PN extends the head range in place, so the
+    %% range count cannot grow and the cap scan is skipped.
+    NewRanges =
+        case LargestRecv =/= undefined andalso PN =:= LargestRecv + 1 of
+            true -> add_to_ack_ranges(PN, Ranges);
+            false -> cap_ack_ranges(add_to_ack_ranges(PN, Ranges))
+        end,
     PNSpace#pn_space{
         largest_recv = NewLargest,
         recv_time = Now,
