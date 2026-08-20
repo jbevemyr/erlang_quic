@@ -24,7 +24,13 @@ LDFLAGS += -L$(OPENSSL_LIBDIR) -Wl,-rpath,$(OPENSSL_LIBDIR)
 CFLAGS += -I$(OPENSSL_LIBDIR)../include
 endif
 
-all: $(PRIV)/quic_crypto_nif.so
+UNAME := $(shell uname -s)
+NIFS := $(PRIV)/quic_crypto_nif.so
+ifeq ($(UNAME),Linux)
+NIFS += $(PRIV)/quic_mmsg_nif.so
+endif
+
+all: $(NIFS)
 
 $(PRIV)/quic_crypto_nif.so: quic_crypto_nif.c
 	@mkdir -p $(PRIV)
@@ -35,7 +41,18 @@ $(PRIV)/quic_crypto_nif.so: quic_crypto_nif.c
 	         "the pure-Erlang crypto path will be used" >&2; \
 	fi
 
+# sendmmsg(2) is Linux-only; quic_mmsg falls back to per-batch sendmsg
+# when the .so is absent.
+$(PRIV)/quic_mmsg_nif.so: quic_mmsg_nif.c
+	@mkdir -p $(PRIV)
+	@if $(CC) $(CFLAGS) -fPIC -shared -o $@ $< -I"$(ERTS_INCLUDE)"; then \
+	    echo "quic_mmsg_nif: built $@"; \
+	else \
+	    echo "quic_mmsg_nif: build failed; the per-batch sendmsg path" \
+	         "will be used" >&2; \
+	fi
+
 clean:
-	rm -f $(PRIV)/quic_crypto_nif.so
+	rm -f $(PRIV)/quic_crypto_nif.so $(PRIV)/quic_mmsg_nif.so
 
 .PHONY: all clean

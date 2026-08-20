@@ -424,6 +424,9 @@
 %% larger than either is split across writes.
 -define(MAX_GSO_SEGMENTS, 64).
 -define(MAX_GSO_PAYLOAD, 65535).
+%% Max batches drained per shared-sender wakeup; matches the sendmmsg
+%% NIF entry cap.
+-define(SENDER_DRAIN_MAX, 64).
 
 %%====================================================================
 %% Records

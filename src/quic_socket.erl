@@ -127,7 +127,10 @@
     %% concurrent senders), so server connections serialize the actual
     %% syscalls through the listener's sender while keeping their own
     %% batch buffers and GSO grouping.
-    sender_pid = undefined :: undefined | pid()
+    sender_pid = undefined :: undefined | pid(),
+    %% Raw fd for the sendmmsg NIF path (shared sender only); undefined
+    %% when the NIF is unavailable or the backend is not socket.
+    mmsg_fd = undefined :: undefined | integer()
 }).
 
 %% Packet can be:
@@ -455,33 +458,34 @@ new_sender(Socket, Opts) ->
 %% lives in the sender's own socket_state copy.
 -spec start_shared_sender(socket_state()) -> pid().
 start_shared_sender(#socket_state{} = SS) ->
+    Fd =
+        case SS#socket_state.backend =:= socket andalso quic_mmsg:available() of
+            true ->
+                case socket:getopt(SS#socket_state.socket, otp, fd) of
+                    {ok, F} -> F;
+                    {error, _} -> undefined
+                end;
+            false ->
+                undefined
+        end,
     Template = SS#socket_state{
         sender_pid = undefined,
         owns_socket = false,
         batch_buffer = [],
         batch_count = 0,
-        batch_addr = undefined
+        batch_addr = undefined,
+        mmsg_fd = Fd
     },
     spawn_link(fun() -> shared_sender_loop(Template) end).
 
 shared_sender_loop(SS) ->
     receive
         {send_batch, Addr, Buffer, Count} ->
-            Loaded = SS#socket_state{
-                batch_buffer = Buffer,
-                batch_count = Count,
-                batch_addr = Addr
-            },
-            SS2 =
-                case flush(Loaded) of
-                    {ok, S} ->
-                        S;
-                    {error, Reason, S} ->
-                        ?LOG_WARNING(
-                            #{what => shared_sender_flush_failed, reason => Reason}
-                        ),
-                        S
-                end,
+            %% Under load batches from many connections queue up; drain
+            %% them and put mixed-destination packets on one sendmmsg
+            %% when the NIF is available.
+            Batches = drain_send_batches([{Addr, Buffer, Count}], ?SENDER_DRAIN_MAX - 1),
+            SS2 = sender_send(SS, Batches),
             %% Carry forward only the socket-global bits (a partial GSO
             %% send disables GSO for the socket).
             shared_sender_loop(SS#socket_state{
@@ -490,6 +494,89 @@ shared_sender_loop(SS) ->
             });
         stop ->
             ok
+    end.
+
+drain_send_batches(Acc, 0) ->
+    lists:reverse(Acc);
+drain_send_batches(Acc, N) ->
+    receive
+        {send_batch, Addr, Buffer, Count} ->
+            drain_send_batches([{Addr, Buffer, Count} | Acc], N - 1)
+    after 0 ->
+        lists:reverse(Acc)
+    end.
+
+sender_send(#socket_state{mmsg_fd = Fd} = SS, Batches) when
+    is_integer(Fd), length(Batches) > 1
+->
+    %% Every batch becomes one or more entries in drain order: mixing
+    %% NIF sends with fallback flushes would reorder packets within a
+    %% flow and trip the peer's packet-threshold loss detection.
+    Entries = lists:append([batch_entries(SS, B) || B <- Batches]),
+    send_entry_chunks(Fd, Entries),
+    SS;
+sender_send(SS, Batches) ->
+    lists:foldl(fun(B, S) -> sender_flush_one(S, B) end, SS, Batches).
+
+%% Entry payloads are in transmission order (batch buffers are stored
+%% newest-first). Uniform batches go out as GSO trains capped at the
+%% kernel's segment/payload limits; anything else as one entry per
+%% packet.
+batch_entries(_SS, {{IP, Port}, [Packet], 1}) ->
+    [{IP, Port, normalize_packet(Packet), 0}];
+batch_entries(SS, {{IP, Port}, Buffer, _Count}) ->
+    GSO =
+        case SS#socket_state.gso_supported of
+            true -> gso_segment_size(Buffer);
+            false -> false
+        end,
+    case GSO of
+        {ok, SegSize} ->
+            Packets = lists:reverse(Buffer),
+            [
+                {IP, Port, [normalize_packet(P) || P <- Run], SegSize}
+             || Run <- chunk_packets(Packets, gso_segments_per_write(SegSize))
+            ];
+        false ->
+            [{IP, Port, normalize_packet(P), 0} || P <- lists:reverse(Buffer)]
+    end.
+
+send_entry_chunks(_Fd, []) ->
+    ok;
+send_entry_chunks(Fd, Entries) ->
+    {Chunk, Rest} =
+        case length(Entries) > ?SENDER_DRAIN_MAX of
+            true -> lists:split(?SENDER_DRAIN_MAX, Entries);
+            false -> {Entries, []}
+        end,
+    case quic_mmsg:send_many(Fd, Chunk) of
+        {ok, Sent} when Sent =:= length(Chunk) ->
+            ok;
+        {ok, Sent} ->
+            ?LOG_WARNING(#{
+                what => sendmmsg_partial,
+                wanted => length(Chunk),
+                sent => Sent
+            });
+        {error, Reason} ->
+            ?LOG_WARNING(#{what => sendmmsg_failed, reason => Reason})
+    end,
+    send_entry_chunks(Fd, Rest).
+
+sender_flush_one(SS, {Addr, Buffer, Count}) ->
+    Loaded = SS#socket_state{
+        batch_buffer = Buffer,
+        batch_count = Count,
+        batch_addr = Addr
+    },
+    case flush(Loaded) of
+        {ok, S} ->
+            S;
+        {error, Reason, S} ->
+            ?LOG_WARNING(
+                #{what => shared_sender_flush_failed, reason => Reason}
+            ),
+            S
     end.
 
 bump_batch_counters(#socket_state{} = State, Count) ->
