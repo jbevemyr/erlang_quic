@@ -66,6 +66,16 @@ init([]) ->
     DistOpts = application:get_env(quic, dist, []),
 
     Children = [
+        %% File-triggered in-node profiler; ignored unless QUIC_PROF_DIR
+        %% is set (init/1 returns ignore).
+        #{
+            id => quic_prof,
+            start => {quic_prof, start_link, []},
+            restart => transient,
+            shutdown => 5000,
+            type => worker,
+            modules => [quic_prof]
+        },
         #{
             id => quic_server_registry,
             start => {quic_server_registry, start_link, []},
