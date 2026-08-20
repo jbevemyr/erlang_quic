@@ -5,7 +5,7 @@
 %%%
 %%%   <dir>/msacc.txt  - 10 s microstate accounting (emulator vs port
 %%%                      vs GC vs sleep split per thread type)
-%%%   <dir>/eprof.txt  - 10 s eprof over all processes, sorted
+%%%   <dir>/stacks.txt - sampled current_function of busy processes
 %%%   <dir>/procs.txt  - top processes by reductions over the window
 %%%   <dir>/done       - marker written last
 %%%
@@ -70,19 +70,57 @@ run_round(Dir) ->
         (I = erlang:process_info(P, reductions)) =/= undefined
     ],
 
-    %% msacc window.
-    ok = msacc_to_file(filename:join(Dir, "msacc.txt")),
+    %% Sections are independent; a failure in one leaves the others' output.
+    section(Dir, "msacc", fun() -> msacc_to_file(filename:join(Dir, "msacc.txt")) end),
+    section(Dir, "stacks", fun() -> stacks_to_file(filename:join(Dir, "stacks.txt")) end),
+    section(Dir, "procs", fun() -> procs_to_file(filename:join(Dir, "procs.txt"), Before) end).
 
-    %% eprof window over everything but eprof itself.
-    Procs = erlang:processes() -- [whereis(eprof)],
-    profiling = eprof:start_profiling(Procs),
-    timer:sleep(?SAMPLE_MS),
-    _ = eprof:stop_profiling(),
-    ok = eprof:log(filename:join(Dir, "eprof.txt")),
-    _ = eprof:analyze(total),
-    _ = eprof:stop(),
+section(Dir, Name, F) ->
+    try
+        F()
+    catch
+        C:E:St ->
+            _ = file:write_file(
+                filename:join(Dir, "error-" ++ Name ++ ".txt"),
+                io_lib:format("~p:~p~n~p~n", [C, E, St])
+            )
+    end.
 
-    %% Reductions delta.
+%% Sampling profiler: current_function of running/runnable processes,
+%% aggregated over the window. No dependency on the tools application.
+stacks_to_file(Path) ->
+    Samples = ?SAMPLE_MS div 50,
+    Tab = sample_loop(Samples, #{}),
+    Sorted = lists:reverse(lists:keysort(2, maps:to_list(Tab))),
+    ok = file:write_file(
+        Path,
+        [
+            io_lib:format("~6b ~w~n", [C, MFA])
+         || {MFA, C} <- lists:sublist(Sorted, 80)
+        ]
+    ).
+
+sample_loop(0, Acc) ->
+    Acc;
+sample_loop(N, Acc) ->
+    Acc1 = lists:foldl(
+        fun(P, A) ->
+            case erlang:process_info(P, [status, current_function]) of
+                [{status, S}, {current_function, MFA}] when
+                    S =:= running; S =:= runnable
+                ->
+                    maps:update_with(MFA, fun(C) -> C + 1 end, 1, A);
+                _ ->
+                    A
+            end
+        end,
+        Acc,
+        erlang:processes() -- [self()]
+    ),
+    timer:sleep(50),
+    sample_loop(N - 1, Acc1).
+
+procs_to_file(Path, Before) ->
     Lines = lists:filtermap(
         fun({P, R0}) ->
             case erlang:process_info(P, [reductions, registered_name, current_function]) of
@@ -96,7 +134,7 @@ run_round(Dir) ->
     ),
     Top = lists:sublist(lists:reverse(lists:sort(Lines)), 20),
     ok = file:write_file(
-        filename:join(Dir, "procs.txt"),
+        Path,
         [io_lib:format("~12b ~w ~w ~w~n", [D, P, N, C]) || {D, P, N, C} <- Top]
     ).
 
