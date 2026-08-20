@@ -5255,8 +5255,9 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% Retransmit lost packets
                     State4 = retransmit_lost_packets(LostPackets, State3),
 
-                    %% Reset PTO timer after ACK processing
-                    State5 = set_pto_timer(State4),
+                    %% Reset the PTO timer at the end of the receive pass
+                    %% (flush_dirty_timers) instead of once per ACK frame.
+                    State5 = State4#state{pto_dirty = true},
 
                     %% Try to send queued data now that cwnd may have freed up.
                     %% This also drains retransmit_stream entries deferred by CC.
