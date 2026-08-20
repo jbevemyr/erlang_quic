@@ -41,6 +41,7 @@
     open/2,
     open_for_send/2,
     open_server_send/2,
+    start_shared_sender/1,
     open_adapter/1,
     wrap/2,
     new_sender/2,
@@ -118,7 +119,15 @@
     %% cannot be mistaken for offload.
     batch_flushes = 0 :: non_neg_integer(),
     packets_coalesced = 0 :: non_neg_integer(),
-    gso_flushes = 0 :: non_neg_integer()
+    gso_flushes = 0 :: non_neg_integer(),
+    %% Shared sender process: when set, flush/1 hands the batch to this
+    %% process instead of calling sendmsg from the connection process.
+    %% Concurrent sendmsg on one socket handle burns ~20x the CPU in
+    %% NIF-level contention (measured 98.6 vs 4.7 us per send with 50
+    %% concurrent senders), so server connections serialize the actual
+    %% syscalls through the listener's sender while keeping their own
+    %% batch buffers and GSO grouping.
+    sender_pid = undefined :: undefined | pid()
 }).
 
 %% Packet can be:
@@ -435,9 +444,59 @@ new_sender(Socket, Opts) ->
         gso_supported = GSOSupported andalso (Backend =:= socket),
         gro_enabled = false,
         batching_enabled = BatchingEnabled,
-        max_batch_packets = MaxBatch
+        max_batch_packets = MaxBatch,
+        sender_pid = maps:get(sender_pid, Opts, undefined)
     },
     {ok, State}.
+
+%% @doc Spawn the shared sender for a listener socket: a process that
+%% performs the actual sendmsg calls for every server connection's
+%% batches, serially. GSO state (including the partial-send disable)
+%% lives in the sender's own socket_state copy.
+-spec start_shared_sender(socket_state()) -> pid().
+start_shared_sender(#socket_state{} = SS) ->
+    Template = SS#socket_state{
+        sender_pid = undefined,
+        owns_socket = false,
+        batch_buffer = [],
+        batch_count = 0,
+        batch_addr = undefined
+    },
+    spawn_link(fun() -> shared_sender_loop(Template) end).
+
+shared_sender_loop(SS) ->
+    receive
+        {send_batch, Addr, Buffer, Count} ->
+            Loaded = SS#socket_state{
+                batch_buffer = Buffer,
+                batch_count = Count,
+                batch_addr = Addr
+            },
+            SS2 =
+                case flush(Loaded) of
+                    {ok, S} ->
+                        S;
+                    {error, Reason, S} ->
+                        ?LOG_WARNING(
+                            #{what => shared_sender_flush_failed, reason => Reason}
+                        ),
+                        S
+                end,
+            %% Carry forward only the socket-global bits (a partial GSO
+            %% send disables GSO for the socket).
+            shared_sender_loop(SS#socket_state{
+                gso_supported = SS2#socket_state.gso_supported,
+                gso_size = SS2#socket_state.gso_size
+            });
+        stop ->
+            ok
+    end.
+
+bump_batch_counters(#socket_state{} = State, Count) ->
+    State#socket_state{
+        batch_flushes = State#socket_state.batch_flushes + 1,
+        packets_coalesced = State#socket_state.packets_coalesced + max(0, Count - 1)
+    }.
 
 %% @doc Close the socket and flush any pending packets.
 %% Only closes the socket if owns_socket is true (i.e., socket was created by us).
@@ -511,6 +570,20 @@ send(#socket_state{} = State, IP, Port, Packet) ->
 flush(#socket_state{batch_count = 0} = State) ->
     %% Nothing to flush
     {ok, State};
+flush(
+    #socket_state{
+        sender_pid = Sender,
+        batch_count = Count,
+        batch_addr = Addr,
+        batch_buffer = Buffer
+    } = State
+) when is_pid(Sender), Addr =/= undefined ->
+    %% Hand the whole batch to the shared sender (see the sender_pid
+    %% field comment). Fire-and-forget: send errors are logged by the
+    %% sender and covered by loss recovery, the same contract as the
+    %% direct path's error handling.
+    Sender ! {send_batch, Addr, Buffer, Count},
+    {ok, bump_batch_counters(clear_batch(State), Count)};
 flush(#socket_state{batch_count = Count, batch_addr = undefined} = State) ->
     %% No address set but have data - shouldn't happen, but clear buffer
     ?LOG_WARNING(#{what => flush_no_addr, buffer_size => Count}),
