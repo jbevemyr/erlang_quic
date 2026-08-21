@@ -57,6 +57,8 @@
     get_fd/1,
     get_socket/1,
     gso_supported/1,
+    os_info/1,
+    pending/1,
     info/1,
     start_client_receiver/2,
     stop_client_receiver/1,
@@ -321,6 +323,11 @@ set_socket(#socket_state{} = State, NewSocket) ->
     State#socket_state{socket = NewSocket}.
 
 %% @doc Check if GSO is supported for this socket_state.
+%% DIAG: packets still sitting in the batch buffer.
+-spec pending(socket_state() | undefined) -> non_neg_integer().
+pending(undefined) -> 0;
+pending(#socket_state{batch_count = N}) -> N.
+
 -spec gso_supported(socket_state()) -> boolean().
 gso_supported(#socket_state{gso_supported = Supported}) ->
     Supported.
@@ -328,6 +335,20 @@ gso_supported(#socket_state{gso_supported = Supported}) ->
 %% @doc Return a map describing the socket_state's configuration and
 %% observability counters. Intended for debugging, benchmarking, and
 %% test assertions.
+%% DIAG: kernel-level view of the socket for stall debugging.
+-spec os_info(socket_state()) -> map().
+os_info(#socket_state{backend = socket, socket = Socket}) ->
+    Counters =
+        case socket:info(Socket) of
+            #{counters := C} -> maps:with([read_pkg, write_pkg, read_byte, write_byte], C);
+            _ -> #{}
+        end,
+    #{sockname => socket:sockname(Socket), counters => Counters};
+os_info(#socket_state{backend = gen_udp, socket = Socket}) ->
+    #{sockname => inet:sockname(Socket)};
+os_info(_) ->
+    #{}.
+
 -spec info(socket_state()) ->
     #{
         backend := gen_udp | socket,
@@ -506,12 +527,13 @@ drain_send_batches(Acc, N) ->
         lists:reverse(Acc)
     end.
 
-sender_send(#socket_state{mmsg_fd = Fd} = SS, Batches) when
-    is_integer(Fd), length(Batches) > 1
-->
-    %% Every batch becomes one or more entries in drain order: mixing
-    %% NIF sends with fallback flushes would reorder packets within a
-    %% flow and trip the peer's packet-threshold loss detection.
+sender_send(#socket_state{mmsg_fd = Fd} = SS, Batches) when is_integer(Fd) ->
+    %% Single batches go through the NIF as well: the prim_socket
+    %% sendmsg path costs several times the raw syscall in NIF-level
+    %% setup per call. Every batch becomes one or more entries in
+    %% drain order: mixing NIF sends with fallback flushes would
+    %% reorder packets within a flow and trip the peer's
+    %% packet-threshold loss detection.
     Entries = lists:append([batch_entries(SS, B) || B <- Batches]),
     send_entry_chunks(Fd, Entries),
     SS;

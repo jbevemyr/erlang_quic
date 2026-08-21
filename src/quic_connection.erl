@@ -380,6 +380,16 @@
     %% one-shot flight; bumps after HRR so CH2 / ServerHello continue
     %% the stream (RFC 9001 §4.1.3).
     initial_tx_off = 0 :: non_neg_integer(),
+    %% Server handshake-flight retransmission: the ServerHello (with its
+    %% Initial CRYPTO offset) and the Handshake-level payload are kept
+    %% until the client's Finished arrives, and replayed on a backoff
+    %% timer. Initial/Handshake packets are not loss-tracked, so without
+    %% this a single lost flight wedges the handshake permanently: the
+    %% client's Initial retransmits only elicit ACKs once the server TLS
+    %% state has advanced.
+    server_flight = undefined :: undefined | {binary(), non_neg_integer(), binary()},
+    server_hs_rtx_timer = undefined :: undefined | reference(),
+    server_hs_rtx_attempts = 0 :: non_neg_integer(),
     %% Client-side: CH1 random + build opts, needed to rebuild CH2
     tls_ch1_random :: binary() | undefined,
     tls_ch1_opts :: map() | undefined,
@@ -2578,6 +2588,15 @@ handle_common_event(
     #state{owner_mon = Mon} = State
 ) ->
     {stop, {shutdown, owner_down}, State};
+handle_common_event(
+    info,
+    {server_hs_rtx, Ref},
+    _StateName,
+    #state{server_hs_rtx_timer = Ref, role = server} = State
+) ->
+    {keep_state, server_hs_retransmit(State#state{server_hs_rtx_timer = undefined})};
+handle_common_event(info, {server_hs_rtx, _Stale}, _StateName, State) ->
+    {keep_state, State};
 handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     %% EXIT signals are handled in terminate/3 callback
     %% Just ignore here - the process will terminate anyway if it's from parent
@@ -2656,6 +2675,27 @@ handle_common_event(
         queue_count => QC,
         queue_bytes => QB,
         head => Head,
+        remote_addr => State#state.remote_addr,
+        packets_received => State#state.packets_received,
+        tls_state => State#state.tls_state,
+        crypto_offset => State#state.crypto_offset,
+        packets_sent => State#state.packets_sent,
+        amp_rx => State#state.amp_rx,
+        hs_rtx_attempts => State#state.server_hs_rtx_attempts,
+        hs_rtx_armed => State#state.server_hs_rtx_timer =/= undefined,
+        server_flight_kept => State#state.server_flight =/= undefined,
+        amp_tx => State#state.amp_tx,
+        amp_deferred_n => length(State#state.amp_deferred),
+        address_validated => State#state.address_validated,
+        pto_armed => State#state.pto_timer =/= undefined,
+        pto_dirty => State#state.pto_dirty,
+        pto_count => quic_loss:pto_count(State#state.loss_state),
+        in_flight_pns => quic_loss:sent_packet_count(State#state.loss_state),
+        socket_os =>
+            case State#state.socket_state of
+                undefined -> undefined;
+                SockSt -> quic_socket:os_info(SockSt)
+            end,
         streams => lists:sort(Ss)
     },
     {keep_state, State, [{reply, From, Reply}]};
@@ -2999,7 +3039,10 @@ ensure_ticket_table() ->
 %% Initial CRYPTO offset (non-zero only after a HelloRetryRequest).
 send_server_hello(ServerHelloMsg, State) ->
     Off = State#state.initial_tx_off,
-    State1 = State#state{initial_tx_off = Off + byte_size(ServerHelloMsg)},
+    State1 = State#state{
+        initial_tx_off = Off + byte_size(ServerHelloMsg),
+        server_flight = {ServerHelloMsg, Off, <<>>}
+    },
     %% Chunk across Initial packets: a hybrid ServerHello Initial is
     %% ~1225 bytes and no longer fits one datagram.
     {_Frames, NewState} = send_initial_crypto(ServerHelloMsg, Off, State1),
@@ -3250,7 +3293,15 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
 
     %% Send the flight, segmented so no datagram exceeds the peer's
     %% max_udp_payload_size (issue #134).
-    send_handshake_crypto(HandshakePayload, State1).
+    State2 = send_handshake_crypto(HandshakePayload, State1),
+    State3 =
+        case State2#state.server_flight of
+            {SH, SHOff, _} ->
+                State2#state{server_flight = {SH, SHOff, HandshakePayload}};
+            undefined ->
+                State2
+        end,
+    arm_server_hs_rtx(State3).
 
 %% @private Send a handshake CRYPTO payload as one or more packets,
 %% each sized to stay within max_udp_payload_size (RFC 9000 §14.1).
@@ -4057,6 +4108,49 @@ amp_flush_budget(#state{amp_deferred = [Packet | Rest]} = State) ->
             State
     end.
 
+%% Arm (or re-arm) the server handshake-flight retransmit timer.
+arm_server_hs_rtx(#state{role = server, server_flight = {_, _, _}} = State) ->
+    case State#state.server_hs_rtx_attempts < ?HS_RTX_MAX_ATTEMPTS of
+        true ->
+            Delay = min(
+                ?HS_RTX_BASE_MS bsl State#state.server_hs_rtx_attempts, ?HS_RTX_MAX_MS
+            ),
+            Ref = make_ref(),
+            erlang:send_after(Delay, self(), {server_hs_rtx, Ref}),
+            State#state{server_hs_rtx_timer = Ref};
+        false ->
+            State#state{server_hs_rtx_timer = undefined}
+    end;
+arm_server_hs_rtx(State) ->
+    State.
+
+%% Replay the retained server flight: ServerHello at its original
+%% Initial CRYPTO offset plus the Handshake payload (offset 0). New
+%% packet numbers, identical crypto stream bytes, so the client's
+%% reassembly is byte-exact regardless of what it already received.
+server_hs_retransmit(#state{tls_state = ?TLS_HANDSHAKE_COMPLETE} = State) ->
+    State#state{server_flight = undefined};
+server_hs_retransmit(#state{server_flight = {SH, SHOff, HsPayload}} = State) ->
+    ?LOG_WARNING(
+        #{
+            what => server_handshake_flight_retransmit,
+            attempt => State#state.server_hs_rtx_attempts + 1
+        },
+        ?QUIC_LOG_META
+    ),
+    {_Frames, State1} = send_initial_crypto(SH, SHOff, State),
+    State2 =
+        case HsPayload of
+            <<>> -> State1;
+            _ -> send_handshake_crypto(HsPayload, State1)
+        end,
+    State3 = State2#state{
+        server_hs_rtx_attempts = State2#state.server_hs_rtx_attempts + 1
+    },
+    arm_server_hs_rtx(flush_dirty_timers(flush_socket_batch(State3)));
+server_hs_retransmit(State) ->
+    State.
+
 %% State-timeout action driving client Initial retransmission while the
 %% handshake is incomplete. Empty for the server, once connected, or once
 %% the attempt budget is spent (the idle timeout then closes).
@@ -4098,11 +4192,21 @@ retransmit_initial_flight(
 retransmit_initial_flight(_StateName, State) ->
     {keep_state, State}.
 
+%% Batched variant of handle_packet/2: same anti-amplification
+%% accounting per datagram, one deferred-flight flush per batch. The
+%% batched delivery path previously skipped accounting entirely, so a
+%% server's amp budget froze at the first datagram under load and
+%% deferred flights never flushed.
+handle_packets_batch(Packets, State) ->
+    State1 = lists:foldl(fun amp_account_recv/2, State, Packets),
+    State2 = do_handle_packets_batch(Packets, State1),
+    amp_flush(State2).
+
 %% Handle batch of packets from GRO - process all without re-entering gen_statem
 %% This is more efficient than receiving multiple messages
-handle_packets_batch([], State) ->
+do_handle_packets_batch([], State) ->
     State;
-handle_packets_batch([<<0:1, 1:1, _:6, _/binary>> | _] = Packets, State) ->
+do_handle_packets_batch([<<0:1, 1:1, _:6, _/binary>> | _] = Packets, State) ->
     %% Leading run of short-header (1-RTT) datagrams: open the whole
     %% run in one NIF call when the fused fast path applies.
     case fused_run_keys(State) of
@@ -4110,11 +4214,11 @@ handle_packets_batch([<<0:1, 1:1, _:6, _/binary>> | _] = Packets, State) ->
             handle_short_run(Packets, Keys, State);
         no ->
             [Packet | Rest] = Packets,
-            handle_packets_batch(Rest, handle_packet_loop(Packet, State))
+            do_handle_packets_batch(Rest, handle_packet_loop(Packet, State))
     end;
-handle_packets_batch([Packet | Rest], State) ->
+do_handle_packets_batch([Packet | Rest], State) ->
     NewState = handle_packet_loop(Packet, State),
-    handle_packets_batch(Rest, NewState).
+    do_handle_packets_batch(Rest, NewState).
 
 %% Peer-direction keys for the batched fused open, under the same
 %% no-key-update-in-flight condition as fused_decrypt_keys/2.
@@ -4147,17 +4251,17 @@ handle_short_run(Packets, Keys, State) ->
             State1 = fold_opened(Results, State),
             case lists:nthtail(length(Results), Run) of
                 [] ->
-                    handle_packets_batch(Tail, State1);
+                    do_handle_packets_batch(Tail, State1);
                 [Unopened | RunRest] ->
                     %% First datagram the NIF could not open takes the
                     %% generic path (slow decrypt, key-phase transition,
                     %% stateless-reset check), then keep batching.
                     State2 = handle_packet_loop(Unopened, State1),
-                    handle_packets_batch(RunRest ++ Tail, State2)
+                    do_handle_packets_batch(RunRest ++ Tail, State2)
             end;
         fallback ->
             [Packet | Rest] = Packets,
-            handle_packets_batch(Rest, handle_packet_loop(Packet, State))
+            do_handle_packets_batch(Rest, handle_packet_loop(Packet, State))
     end.
 
 take_short_run([<<0:1, 1:1, _:6, _/binary>> = P | Rest], Acc) ->
@@ -4324,7 +4428,7 @@ fold_opened([{PN, FirstByte, Plaintext} | Rest], State, Now, N, Elicited) ->
 %% per drain.
 server_recv_pass(Packets, RemoteAddr, State) ->
     State1 = State#state{current_packet_source = RemoteAddr, has_non_probing_frame = false},
-    NewState = handle_packets_batch(Packets, State1),
+    NewState = do_handle_packets_batch(Packets, State1),
     case NewState#state.has_non_probing_frame of
         true ->
             TotalSize = lists:sum([byte_size(P) || P <- Packets]),
@@ -5806,6 +5910,20 @@ buffer_crypto_data(Level, Offset, Data, State) ->
                 ?QUIC_CRYPTO_BUFFER_EXCEEDED, <<"crypto buffer exceeded">>, State
             );
         false ->
+            Expected = maps:get(LevelAtom, State#state.crypto_offset, 0),
+            case Offset > Expected of
+                true ->
+                    ?LOG_WARNING(#{
+                        what => crypto_gap,
+                        role => State#state.role,
+                        level => LevelAtom,
+                        frame_offset => Offset,
+                        frame_len => byte_size(Data),
+                        expected_offset => Expected
+                    });
+                false ->
+                    ok
+            end,
             %% Add data to buffer
             NewBuffer = maps:put(Offset, Data, Buffer),
             NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State#state.crypto_buffer),
@@ -5866,7 +5984,18 @@ process_tls_messages(Level, Data, State) ->
         {error, incomplete} ->
             %% Buffer the incomplete data for next CRYPTO frame
             State#state{tls_buffer = maps:put(Level, Data, State#state.tls_buffer)};
-        {error, _Err} ->
+        {error, Err} ->
+            ?LOG_WARNING(
+                #{
+                    what => tls_message_decode_failed,
+                    level => Level,
+                    reason => Err,
+                    role => State#state.role,
+                    size => byte_size(Data),
+                    head => binary:part(Data, 0, min(16, byte_size(Data)))
+                },
+                ?QUIC_LOG_META
+            ),
             State
     end.
 
@@ -6271,6 +6400,7 @@ process_tls_message(
 
                     State1 = State#state{
                         tls_state = ?TLS_HANDSHAKE_COMPLETE,
+                        server_flight = undefined,
                         tls_transcript = <<Transcript2/binary, ClientFinishedMsg/binary>>,
                         master_secret = MasterSecret,
                         app_keys = {ClientAppKeys, ServerAppKeys},
@@ -6320,9 +6450,11 @@ process_tls_message(
                     ),
 
                     %% Application keys are already derived when server sent its Finished
-                    %% Mark handshake as complete
+                    %% Mark handshake as complete; the retained flight is
+                    %% no longer needed for retransmission.
                     State1 = State#state{
                         tls_state = ?TLS_HANDSHAKE_COMPLETE,
+                        server_flight = undefined,
                         tls_transcript = Transcript,
                         resumption_secret = ResumptionSecret
                     },
@@ -6509,7 +6641,18 @@ process_tls_message(
             ?LOG_ERROR(#{what => client_cert_verify_failed}, ?QUIC_LOG_META),
             send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
     end;
-process_tls_message(_Level, _Type, _Body, _OriginalMsg, State) ->
+process_tls_message(Level, Type, Body, _OriginalMsg, State) ->
+    ?LOG_WARNING(
+        #{
+            what => tls_message_ignored,
+            level => Level,
+            type => Type,
+            size => byte_size(Body),
+            role => State#state.role,
+            tls_state => State#state.tls_state
+        },
+        ?QUIC_LOG_META
+    ),
     State.
 
 %% @private Continue a server-side ClientHello once the key-exchange

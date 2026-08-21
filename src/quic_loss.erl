@@ -65,6 +65,7 @@
     sent_packets/1,
     bytes_in_flight/1,
     last_progress/1,
+    sent_packet_count/1,
     pto_count/1,
     oldest_unacked/1,
     has_rtt_sample/1
@@ -219,7 +220,9 @@ on_packet_sent(
 %% at the same instant: one queue fold and one record update. Tracked
 %% is [{PN, Size, Frame}] in ascending PN order. Returns the updated
 %% state and the total size (for the CC in-flight update).
--spec on_packets_sent_run(loss_state(), [{non_neg_integer(), non_neg_integer(), term()}], integer()) ->
+-spec on_packets_sent_run(
+    loss_state(), [{non_neg_integer(), non_neg_integer(), term()}], integer()
+) ->
     {loss_state(), non_neg_integer()}.
 on_packets_sent_run(#loss_state{sent_q = Q, bytes_in_flight = InFlight} = State, Tracked, Now) ->
     {Q1, Total} = lists:foldl(
@@ -676,6 +679,10 @@ bytes_in_flight(#loss_state{bytes_in_flight = B}) -> B.
 
 %% @doc Get current PTO count.
 -spec pto_count(loss_state()) -> non_neg_integer().
+%% DIAG: tracked in-flight packets.
+sent_packet_count(#loss_state{sent_q = Q}) ->
+    queue:len(Q).
+
 pto_count(#loss_state{pto_count = C}) -> C.
 
 %% @doc Latest sign of forward progress for the disconnect timeout: the
