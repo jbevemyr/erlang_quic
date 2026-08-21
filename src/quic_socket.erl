@@ -523,7 +523,7 @@ sender_send(SS, Batches) ->
 %% kernel's segment/payload limits; anything else as one entry per
 %% packet.
 batch_entries(_SS, {{IP, Port}, [Packet], 1}) ->
-    [{IP, Port, normalize_packet(Packet), 0}];
+    [{IP, Port, erlang:iolist_to_iovec(normalize_packet(Packet)), 0}];
 batch_entries(SS, {{IP, Port}, Buffer, _Count}) ->
     GSO =
         case SS#socket_state.gso_supported of
@@ -534,11 +534,14 @@ batch_entries(SS, {{IP, Port}, Buffer, _Count}) ->
         {ok, SegSize} ->
             Packets = lists:reverse(Buffer),
             [
-                {IP, Port, [normalize_packet(P) || P <- Run], SegSize}
+                {IP, Port, erlang:iolist_to_iovec([normalize_packet(P) || P <- Run]), SegSize}
              || Run <- chunk_packets(Packets, gso_segments_per_write(SegSize))
             ];
         false ->
-            [{IP, Port, normalize_packet(P), 0} || P <- lists:reverse(Buffer)]
+            [
+                {IP, Port, erlang:iolist_to_iovec(normalize_packet(P)), 0}
+             || P <- lists:reverse(Buffer)
+            ]
     end.
 
 send_entry_chunks(_Fd, []) ->

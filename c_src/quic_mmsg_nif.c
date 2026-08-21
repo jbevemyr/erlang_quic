@@ -22,7 +22,7 @@
 #endif
 
 #define MAX_MSGS 64
-#define MAX_IOV 8
+#define MAX_IOV 512
 
 static ERL_NIF_TERM am_ok;
 static ERL_NIF_TERM am_error;
@@ -80,8 +80,6 @@ send_many(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     ERL_NIF_TERM list, head, tail;
     static _Thread_local struct mmsghdr msgs[MAX_MSGS];
     static _Thread_local struct sockaddr_storage addrs[MAX_MSGS];
-    static _Thread_local struct iovec iovs[MAX_MSGS];
-    static _Thread_local ErlNifBinary bins[MAX_MSGS];
     static _Thread_local char cmsgbufs[MAX_MSGS]
         [CMSG_SPACE(sizeof(unsigned short))];
 
@@ -93,6 +91,8 @@ send_many(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         int arity, seg;
         const ERL_NIF_TERM *e;
         socklen_t alen;
+        ErlNifIOVec *iovec = NULL;
+        ERL_NIF_TERM iov_tail;
 
         if (n >= MAX_MSGS)
             return enif_make_badarg(env);
@@ -100,19 +100,20 @@ send_many(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
             return enif_make_badarg(env);
         if (!fill_sockaddr(env, e[0], e[1], &addrs[n], &alen))
             return enif_make_badarg(env);
-        if (!enif_inspect_iolist_as_binary(env, e[2], &bins[n]))
+        /* Payload is an erlang:iolist_to_iovec/1 result; the iov
+         * entries point into the packet binaries, so nothing is
+         * flattened. Env-allocated iovecs stay valid until return. */
+        if (!enif_inspect_iovec(env, MAX_IOV, e[2], &iov_tail, &iovec) ||
+            !enif_is_empty_list(env, iov_tail))
             return enif_make_badarg(env);
         if (!enif_get_int(env, e[3], &seg) || seg < 0 || seg > 0xffff)
             return enif_make_badarg(env);
 
-        iovs[n].iov_base = bins[n].data;
-        iovs[n].iov_len = bins[n].size;
-
         memset(&msgs[n], 0, sizeof(msgs[n]));
         msgs[n].msg_hdr.msg_name = &addrs[n];
         msgs[n].msg_hdr.msg_namelen = alen;
-        msgs[n].msg_hdr.msg_iov = &iovs[n];
-        msgs[n].msg_hdr.msg_iovlen = 1;
+        msgs[n].msg_hdr.msg_iov = (struct iovec *)iovec->iov;
+        msgs[n].msg_hdr.msg_iovlen = iovec->iovcnt;
         if (seg > 0) {
             struct cmsghdr *cm;
             msgs[n].msg_hdr.msg_control = cmsgbufs[n];

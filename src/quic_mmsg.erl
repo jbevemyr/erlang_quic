@@ -21,8 +21,10 @@ load() ->
 available() ->
     persistent_term:get({?MODULE, loaded}, false).
 
-%% Entries: [{Addr, Port, PayloadIolist, GsoSegSize}], SegSize 0 = none.
--spec send_many(integer(), [{inet:ip_address(), inet:port_number(), iodata(), non_neg_integer()}]) ->
+%% Entries: [{Addr, Port, PayloadIovec, GsoSegSize}], SegSize 0 = none.
+%% PayloadIovec must be an erlang:iolist_to_iovec/1 result; the NIF
+%% sends it gather-style without flattening.
+-spec send_many(integer(), [{inet:ip_address(), inet:port_number(), [binary()], non_neg_integer()}]) ->
     {ok, non_neg_integer()} | {error, term()}.
 send_many(_Fd, _Entries) ->
     erlang:nif_error(not_loaded).
