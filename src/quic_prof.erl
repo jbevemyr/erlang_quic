@@ -90,7 +90,11 @@ section(Dir, Name, F) ->
 %% Sampling profiler: current_function of running/runnable processes,
 %% aggregated over the window. No dependency on the tools application.
 stacks_to_file(Path) ->
-    Samples = ?SAMPLE_MS div 50,
+    %% Sample every 2 ms: at 50 ms virtually every tick found the node
+    %% between bursts (71 hits over a 10 s window), far too coarse to
+    %% attribute anything. Restrict sampling to the processes that
+    %% actually run QUIC/volga work so the added rate costs little.
+    Samples = ?SAMPLE_MS div 2,
     {Self, Incl, N} = sample_loop(Samples, #{}, #{}, 0),
     Top = fun(M) ->
         lists:sublist(lists:reverse(lists:keysort(2, maps:to_list(M))), 40)
@@ -141,10 +145,33 @@ sample_loop(K, Self0, Incl0, N0) ->
             end
         end,
         {Self0, Incl0, N0},
-        erlang:processes() -- [self()]
+        interesting_procs()
     ),
-    timer:sleep(50),
+    timer:sleep(2),
     sample_loop(K - 1, Self1, Incl1, N1).
+
+%% Processes whose stacks are worth sampling: anything currently inside
+%% quic/volga code. Recomputed per tick (cheap: one process_info each)
+%% so connections that come and go are still covered.
+interesting_procs() ->
+    [
+        P
+     || P <- erlang:processes(),
+        P =/= self(),
+        case erlang:process_info(P, current_function) of
+            {current_function, {M, _, _}} ->
+                case atom_to_list(M) of
+                    "quic" ++ _ -> true;
+                    "volga" ++ _ -> true;
+                    "prim_file" ++ _ -> true;
+                    "gen_statem" -> true;
+                    "gen_server" -> true;
+                    _ -> false
+                end;
+            _ ->
+                false
+        end
+    ].
 
 procs_to_file(Path, Before) ->
     Lines = lists:filtermap(
