@@ -73,6 +73,7 @@ run_round(Dir) ->
 
     %% Sections are independent; a failure in one leaves the others' output.
     section(Dir, "msacc", fun() -> msacc_to_file(filename:join(Dir, "msacc.txt")) end),
+    section(Dir, "calls", fun() -> calls_to_file(filename:join(Dir, "calls.txt")) end),
     section(Dir, "stacks", fun() -> stacks_to_file(filename:join(Dir, "stacks.txt")) end),
     section(Dir, "procs", fun() -> procs_to_file(filename:join(Dir, "procs.txt"), Before) end).
 
@@ -94,7 +95,7 @@ stacks_to_file(Path) ->
     %% between bursts (71 hits over a 10 s window), far too coarse to
     %% attribute anything. Restrict sampling to the processes that
     %% actually run QUIC/volga work so the added rate costs little.
-    Samples = ?SAMPLE_MS div 2,
+    Samples = ?SAMPLE_MS div 10,
     {Self, Incl, N} = sample_loop(Samples, #{}, #{}, 0),
     Top = fun(M) ->
         lists:sublist(lists:reverse(lists:keysort(2, maps:to_list(M))), 40)
@@ -106,6 +107,46 @@ stacks_to_file(Path) ->
             [io_lib:format("~6b ~w~n", [C, MFA]) || {MFA, C} <- Top(Self)],
             io_lib:format("== inclusive~n", []),
             [io_lib:format("~6b ~w~n", [C, MFA]) || {MFA, C} <- Top(Incl)]
+        ]
+    ).
+
+%% Exact per-function call counts for the QUIC modules over the window.
+%% call_count tracing is far cheaper than eprof (a counter bump per call,
+%% no timestamps) and, unlike sampling, cannot miss short bursts.
+calls_to_file(Path) ->
+    Mods = [
+        quic_connection,
+        quic_socket,
+        quic_frame,
+        quic_varint,
+        quic_loss,
+        quic_cc_newreno,
+        quic_stream,
+        quic_packet
+    ],
+    Loaded = [M || M <- Mods, erlang:module_loaded(M)],
+    _ = [erlang:trace_pattern({M, '_', '_'}, true, [call_count]) || M <- Loaded],
+    timer:sleep(?SAMPLE_MS),
+    Rows = lists:flatten([
+        [
+            begin
+                case erlang:trace_info({M, F, A}, call_count) of
+                    {call_count, C} when is_integer(C), C > 0 -> [{C, {M, F, A}}];
+                    _ -> []
+                end
+            end
+         || {F, A} <- M:module_info(functions)
+        ]
+     || M <- Loaded
+    ]),
+    _ = [erlang:trace_pattern({M, '_', '_'}, false, [call_count]) || M <- Loaded],
+    Sorted = lists:reverse(lists:sort(Rows)),
+    Total = lists:sum([C || {C, _} <- Sorted]),
+    ok = file:write_file(
+        Path,
+        [
+            io_lib:format("total calls ~b over ~b ms~n", [Total, ?SAMPLE_MS]),
+            [io_lib:format("~9b ~w~n", [C, MFA]) || {C, MFA} <- lists:sublist(Sorted, 45)]
         ]
     ).
 
@@ -147,7 +188,7 @@ sample_loop(K, Self0, Incl0, N0) ->
         {Self0, Incl0, N0},
         interesting_procs()
     ),
-    timer:sleep(2),
+    timer:sleep(10),
     sample_loop(K - 1, Self1, Incl1, N1).
 
 %% Processes whose stacks are worth sampling: anything currently inside
