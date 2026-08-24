@@ -4328,8 +4328,8 @@ seq_run_last(_, _) ->
 %% applied for the whole train, every packet known sequential.
 fold_opened_seq([], State, _Now, N, Elicited) ->
     fold_opened_finish(State, N, Elicited);
-fold_opened_seq([{_PN, _FB, Plaintext} | Rest], State, Now, N, Elicited) ->
-    case decode_and_process_streaming(app, Plaintext, State) of
+fold_opened_seq([{_PN, _FB, Third} | Rest], State, Now, N, Elicited) ->
+    case opened_frames(Third, State) of
         {ok, NewState, Frames} ->
             ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
                 packet_type => app,
@@ -4360,6 +4360,22 @@ fold_opened_seq([{_PN, _FB, Plaintext} | Rest], State, Now, N, Elicited) ->
             fold_opened_seq(Rest, State, Now, N, Elicited)
     end.
 
+%% Consume an open_run result: the NIF returns either a pre-parsed
+%% frame list (term-identical to quic_frame:decode/1 output) or
+%% {raw, Plain} for packets with frame types outside the fast path,
+%% which keep the generic decoder and its error semantics.
+opened_frames({raw, Plain}, State) ->
+    decode_and_process_streaming(app, Plain, State);
+opened_frames(Frames, State) when is_list(Frames) ->
+    {ok, process_parsed_frames(Frames, State), Frames}.
+
+process_parsed_frames([], State) ->
+    State;
+process_parsed_frames([F | Rest], #state{close_reason = undefined} = State) ->
+    process_parsed_frames(Rest, process_frame_track_probing(app, F, State));
+process_parsed_frames(_, State) ->
+    State.
+
 fold_opened_finish(State, N, Elicited) ->
     State1 = State#state{packets_received = State#state.packets_received + N},
     case Elicited of
@@ -4373,9 +4389,9 @@ fold_opened_finish(State, N, Elicited) ->
 
 fold_opened([], State, _Now, N, Elicited) ->
     fold_opened_finish(State, N, Elicited);
-fold_opened([{PN, FirstByte, Plaintext} | Rest], State, Now, N, Elicited) ->
+fold_opened([{PN, FirstByte, Third} | Rest], State, Now, N, Elicited) ->
     StateF = record_app_recv(FirstByte, PN, State, Now),
-    case decode_and_process_streaming(app, Plaintext, StateF) of
+    case opened_frames(Third, StateF) of
         {ok, NewState, Frames} ->
             ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
                 packet_type => app,
