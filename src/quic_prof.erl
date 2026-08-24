@@ -5,7 +5,8 @@
 %%%
 %%%   <dir>/msacc.txt  - 10 s microstate accounting (emulator vs port
 %%%                      vs GC vs sleep split per thread type)
-%%%   <dir>/stacks.txt - sampled current_function of busy processes
+%%%   <dir>/stacks.txt - sampled stacks of running processes, attributed
+%%%                      to the innermost non-OTP frame
 %%%   <dir>/procs.txt  - top processes by reductions over the window
 %%%   <dir>/done       - marker written last
 %%%
@@ -90,35 +91,60 @@ section(Dir, Name, F) ->
 %% aggregated over the window. No dependency on the tools application.
 stacks_to_file(Path) ->
     Samples = ?SAMPLE_MS div 50,
-    Tab = sample_loop(Samples, #{}),
-    Sorted = lists:reverse(lists:keysort(2, maps:to_list(Tab))),
+    {Self, Incl, N} = sample_loop(Samples, #{}, #{}, 0),
+    Top = fun(M) ->
+        lists:sublist(lists:reverse(lists:keysort(2, maps:to_list(M))), 40)
+    end,
     ok = file:write_file(
         Path,
         [
-            io_lib:format("~6b ~w~n", [C, MFA])
-         || {MFA, C} <- lists:sublist(Sorted, 80)
+            io_lib:format("samples ~b~n== self~n", [N]),
+            [io_lib:format("~6b ~w~n", [C, MFA]) || {MFA, C} <- Top(Self)],
+            io_lib:format("== inclusive~n", []),
+            [io_lib:format("~6b ~w~n", [C, MFA]) || {MFA, C} <- Top(Incl)]
         ]
     ).
 
-sample_loop(0, Acc) ->
-    Acc;
-sample_loop(N, Acc) ->
-    Acc1 = lists:foldl(
-        fun(P, A) ->
-            case erlang:process_info(P, [status, current_function]) of
-                [{status, S}, {current_function, MFA}] when
-                    S =:= running; S =:= runnable
-                ->
-                    maps:update_with(MFA, fun(C) -> C + 1 end, 1, A);
+%% Frames that only describe OTP plumbing, never the actual work: with
+%% current_function alone virtually every sample lands on
+%% gen_statem:loop, which hides where the time goes.
+generic_frame({gen_statem, _, _}) -> true;
+generic_frame({gen_server, _, _}) -> true;
+generic_frame({gen, _, _}) -> true;
+generic_frame({proc_lib, _, _}) -> true;
+generic_frame({erlang, bif_return_trap, _}) -> true;
+generic_frame(_) -> false.
+
+sample_loop(0, Self, Incl, N) ->
+    {Self, Incl, N};
+sample_loop(K, Self0, Incl0, N0) ->
+    {Self1, Incl1, N1} = lists:foldl(
+        fun(P, {SA, IA, NA}) ->
+            case erlang:process_info(P, [status, current_stacktrace]) of
+                [{status, running}, {current_stacktrace, St}] when St =/= [] ->
+                    App = [{M, F, A} || {M, F, A, _} <- St, not generic_frame({M, F, A})],
+                    SA1 =
+                        case App of
+                            [Innermost | _] ->
+                                maps:update_with(Innermost, fun(C) -> C + 1 end, 1, SA);
+                            [] ->
+                                SA
+                        end,
+                    IA1 = lists:foldl(
+                        fun(Fr, Acc) -> maps:update_with(Fr, fun(C) -> C + 1 end, 1, Acc) end,
+                        IA,
+                        lists:usort(App)
+                    ),
+                    {SA1, IA1, NA + 1};
                 _ ->
-                    A
+                    {SA, IA, NA}
             end
         end,
-        Acc,
+        {Self0, Incl0, N0},
         erlang:processes() -- [self()]
     ),
     timer:sleep(50),
-    sample_loop(N - 1, Acc1).
+    sample_loop(K - 1, Self1, Incl1, N1).
 
 procs_to_file(Path, Before) ->
     Lines = lists:filtermap(
