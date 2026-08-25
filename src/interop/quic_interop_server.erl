@@ -41,9 +41,13 @@
 ]).
 
 main(_Args) ->
-    %% Start required applications
+    %% Start required applications. The quic app supervision matters:
+    %% the resumption ticket table is owned by the server registry, and
+    %% without it the table dies with the first connection that created
+    %% it, so a client resuming after a pause never finds its ticket.
     application:ensure_all_started(crypto),
     application:ensure_all_started(ssl),
+    application:ensure_all_started(quic),
 
     %% Get environment variables
     TestCase = os:getenv("TESTCASE", "handshake"),
@@ -113,7 +117,9 @@ build_server_opts(TestCase, Cert, Key, WwwDir) ->
     %% Test case specific options
     case TestCase of
         "retry" ->
-            BaseOpts#{retry => true};
+            %% The listener reads address_validation; `retry' was set here
+            %% but nothing ever looked at it, so no Retry was sent.
+            BaseOpts#{address_validation => always};
         "chacha20" ->
             BaseOpts#{ciphers => [chacha20_poly1305]};
         "v2" ->
@@ -124,15 +130,22 @@ build_server_opts(TestCase, Cert, Key, WwwDir) ->
 
 %% Decode PEM-encoded private key to internal format
 decode_private_key(PemData) ->
-    case public_key:pem_decode(PemData) of
-        [{Type, Der, not_encrypted}] ->
+    %% A key file may carry more than the key: `openssl ecparam -genkey',
+    %% which is how the interop runner generates its certificates, emits
+    %% EC PARAMETERS ahead of EC PRIVATE KEY. Pick the key entry out of
+    %% the list rather than insisting the file holds exactly one.
+    case [E || {Type, _, _} = E <- public_key:pem_decode(PemData), is_key_entry(Type)] of
+        [{Type, Der, _} | _] ->
             decode_key_entry(Type, Der);
-        [{Type, Der, _Cipher}] ->
-            %% Encrypted key - not supported yet
-            decode_key_entry(Type, Der);
-        _ ->
+        [] ->
             error(invalid_private_key)
     end.
+
+is_key_entry('RSAPrivateKey') -> true;
+is_key_entry('DSAPrivateKey') -> true;
+is_key_entry('ECPrivateKey') -> true;
+is_key_entry('PrivateKeyInfo') -> true;
+is_key_entry(_) -> false.
 
 decode_key_entry('RSAPrivateKey', Der) ->
     public_key:der_decode('RSAPrivateKey', Der);
@@ -144,50 +157,57 @@ decode_key_entry('PrivateKeyInfo', Der) ->
 decode_key_entry(Type, _Der) ->
     error({unsupported_key_type, Type}).
 
-spawn_handler(ConnPid, Conn, WwwDir, TestCase) ->
+spawn_handler(ConnPid, _DCID, WwwDir, TestCase) ->
+    %% The arity-2 connection_handler is called as Fun(ConnPid, DCID); the
+    %% connection handle in every quic message and API call is the pid.
     HandlerPid = spawn(fun() ->
-        connection_handler(ConnPid, Conn, WwwDir, TestCase)
+        connection_handler(ConnPid, WwwDir, TestCase)
     end),
     {ok, HandlerPid}.
 
-connection_handler(ConnPid, Conn, WwwDir, TestCase) ->
+connection_handler(Conn, WwwDir, TestCase) ->
     io:format("Handler started, waiting for messages...~n"),
-    %% Wait for stream data
+    connection_handler(Conn, WwwDir, TestCase, #{}).
+
+%% A request may arrive split across several STREAM frames, so buffer per
+%% stream until FIN before parsing. Serving each fragment as if it were a
+%% whole request answered twice on one stream: two responses, two FINs at
+%% different offsets, and a correct peer kills the connection with
+%% FINAL_SIZE_ERROR.
+connection_handler(Conn, WwwDir, TestCase, Bufs) ->
     receive
         {quic, Conn, {connected, Info}} ->
             io:format("Handler got connected: ~p~n", [Info]),
-            connection_handler(ConnPid, Conn, WwwDir, TestCase);
+            connection_handler(Conn, WwwDir, TestCase, Bufs);
         {quic, Conn, {stream_opened, StreamId}} ->
             io:format("Handler got stream_opened: ~p~n", [StreamId]),
-            handle_stream(ConnPid, Conn, StreamId, WwwDir, TestCase);
+            connection_handler(Conn, WwwDir, TestCase, Bufs);
         {quic, Conn, {stream_data, StreamId, Data, Fin}} ->
-            io:format(
-                "Handler got stream_data: stream=~p size=~p fin=~p~n",
-                [StreamId, byte_size(Data), Fin]
-            ),
-            %% Handle request
-            handle_request(ConnPid, Conn, StreamId, Data, WwwDir, TestCase);
+            Acc = [maps:get(StreamId, Bufs, []) | Data],
+            case Fin of
+                true ->
+                    Request = iolist_to_binary(Acc),
+                    _ = serve_request(Conn, StreamId, Request, WwwDir, TestCase),
+                    connection_handler(
+                        Conn, WwwDir, TestCase, maps:remove(StreamId, Bufs)
+                    );
+                false ->
+                    connection_handler(
+                        Conn, WwwDir, TestCase, Bufs#{StreamId => Acc}
+                    )
+            end;
         {quic, Conn, {closed, Reason}} ->
             io:format("Handler got closed: ~p~n", [Reason]),
             ok;
         Other ->
             io:format("Handler got unexpected: ~p~n", [Other]),
-            connection_handler(ConnPid, Conn, WwwDir, TestCase)
+            connection_handler(Conn, WwwDir, TestCase, Bufs)
     after 60000 ->
         io:format("Handler timeout~n"),
         ok
     end.
 
-handle_stream(_ConnPid, Conn, StreamId, WwwDir, TestCase) ->
-    %% Wait for request on this stream
-    receive
-        {quic, Conn, {stream_data, StreamId, Data, _Fin}} ->
-            handle_request(undefined, Conn, StreamId, Data, WwwDir, TestCase)
-    after 30000 ->
-        ok
-    end.
-
-handle_request(_ConnPid, Conn, StreamId, Data, WwwDir, TestCase) ->
+serve_request(Conn, StreamId, Data, WwwDir, TestCase) ->
     io:format("handle_request: stream=~p data=~p~n", [StreamId, Data]),
     %% Parse simple HTTP/0.9 request: "GET /path\r\n"
     case parse_request(Data) of
