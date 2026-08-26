@@ -4444,13 +4444,132 @@ fold_opened(Results, State) ->
                         last_activity = Now,
                         ack_eliciting_since_recv = false
                     },
-                    fold_opened_seq(Results, State1, Now, 0, 0);
+                    case stream_train(Results, State1) of
+                        {ok, StreamId, FirstOff, RevChunks, Total, N} ->
+                            apply_stream_train(
+                                StreamId, FirstOff, RevChunks, Total, N, State1
+                            );
+                        no ->
+                            fold_opened_seq(Results, State1, Now, 0, 0)
+                    end;
                 no ->
                     fold_opened(Results, State, Now, 0, 0)
             end;
         _ ->
             fold_opened(Results, State, Now, 0, 0)
     end.
+
+%% Textbook bulk train: every packet in the run carries exactly one
+%% stream frame, all for the same stream, offsets contiguous, no FIN,
+%% and qlog is off. Returns the chunks in reverse order.
+stream_train(Results, State) ->
+    case ?QLOG_ENABLED(State#state.qlog_ctx) of
+        true -> no;
+        false -> stream_train(Results, undefined, undefined, [], 0, 0)
+    end.
+
+stream_train([], Sid, _NextOff, RevChunks, Total, N) when Sid =/= undefined ->
+    {ok, Sid, first_off(RevChunks, Total), RevChunks, Total, N};
+stream_train(
+    [{_PN, _FB, [{stream, Sid, Off, Data, false}]} | Rest], undefined, undefined, [], 0, 0
+) ->
+    stream_train(Rest, Sid, Off + byte_size(Data), [{Off, Data}], byte_size(Data), 1);
+stream_train(
+    [{_PN, _FB, [{stream, Sid, Off, Data, false}]} | Rest], Sid, Off, RevChunks, Total, N
+) ->
+    stream_train(
+        Rest, Sid, Off + byte_size(Data), [{Off, Data} | RevChunks], Total + byte_size(Data), N + 1
+    );
+stream_train(_, _, _, _, _, _) ->
+    no.
+
+first_off(RevChunks, _Total) ->
+    {Off, _} = lists:last(RevChunks),
+    Off.
+
+%% One bookkeeping pass for a whole contiguous stream train: the same
+%% conditions as the in-order fast path in
+%% do_process_stream_data_buffered/5, checked once with the train's
+%% totals; any deviation falls back to the per-packet loop.
+apply_stream_train(StreamId, FirstOff, RevChunks, Total, N, State) ->
+    case State#state.streams of
+        #{
+            StreamId := #stream_state{
+                recv_offset = FirstOff,
+                recv_max_data = RecvMaxData,
+                final_size = undefined,
+                recv_reset_at = undefined,
+                recv_buffer = RB
+            } = Stream
+        } ->
+            EndOffset = FirstOff + Total,
+            NewDataReceived = State#state.data_received + Total,
+            HalfWindow = State#state.fc_max_receive_window div 2,
+            case
+                Total > 0 andalso
+                    gb_trees:is_empty(RB) andalso
+                    RecvMaxData - EndOffset >= HalfWindow andalso
+                    State#state.max_data_local - NewDataReceived >= HalfWindow andalso
+                    State#state.recv_buffer_bytes + Total =< ?MAX_RECV_BUFFER_BYTES
+            of
+                true ->
+                    Owner = State#state.owner,
+                    PendDeliver =
+                        case State#state.recv_pass andalso State#state.delivery_coalescing of
+                            true ->
+                                accum_delivery_run(
+                                    Owner, StreamId, RevChunks, State#state.pend_deliver
+                                );
+                            false ->
+                                %% Same contract as the per-packet path:
+                                %% deliver directly, one message per chunk
+                                %% in stream order.
+                                lists:foreach(
+                                    fun({_Off, Data}) ->
+                                        Owner ! {quic, self(), {stream_data, StreamId, Data, false}}
+                                    end,
+                                    lists:reverse(RevChunks)
+                                ),
+                                State#state.pend_deliver
+                        end,
+                    State1 = State#state{
+                        streams = maps:put(
+                            StreamId,
+                            Stream#stream_state{recv_offset = EndOffset},
+                            State#state.streams
+                        ),
+                        data_received = NewDataReceived,
+                        pend_deliver = PendDeliver,
+                        has_non_probing_frame = true
+                    },
+                    fold_opened_finish(State1, N, N);
+                false ->
+                    stream_train_fallback(StreamId, FirstOff, RevChunks, State)
+            end;
+        _ ->
+            stream_train_fallback(StreamId, FirstOff, RevChunks, State)
+    end.
+
+%% Deviating train: replay it through the ordinary per-packet path.
+stream_train_fallback(StreamId, _FirstOff, RevChunks, State) ->
+    {StateN, N} = lists:foldr(
+        fun({Off, Data}, {Acc, Cnt}) ->
+            {process_stream_data(StreamId, Off, Data, false, Acc), Cnt + 1}
+        end,
+        {State, 0},
+        RevChunks
+    ),
+    fold_opened_finish(StateN#state{has_non_probing_frame = true}, N, N).
+
+%% Fold a whole train into the pending delivery run. Chunks arrive in
+%% reverse order and accum_delivery prepends, so foldr keeps stream
+%% order.
+accum_delivery_run(Owner, StreamId, RevChunks, Pend) ->
+    lists:foldr(
+        fun({_Off, Data}, Acc) -> accum_delivery(Owner, StreamId, Data, false, Acc) end,
+        Pend,
+        RevChunks
+    ).
 
 %% Last {PN, FirstByte} of a run iff PNs are consecutive from Expected.
 seq_run_last([{PN, FB, _}], PN) ->
