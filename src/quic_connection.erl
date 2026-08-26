@@ -397,6 +397,11 @@
     %% client's Initial retransmits only elicit ACKs once the server TLS
     %% state has advanced.
     server_flight = undefined :: undefined | {binary(), non_neg_integer(), binary()},
+    %% Client-side: the Certificate(+CertificateVerify)+Finished payload,
+    %% retained until HANDSHAKE_DONE so a lost Finished can be resent
+    %% when the server replays its flight (nothing else retransmits it
+    %% once the statem has left `handshaking').
+    client_hs_flight = undefined :: undefined | binary(),
     server_hs_rtx_timer = undefined :: undefined | reference(),
     server_hs_rtx_attempts = 0 :: non_neg_integer(),
     %% Client-side: CH1 random + build opts, needed to rebuild CH2
@@ -2554,9 +2559,12 @@ handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref}
         true ->
             {next_state, draining, declare_peer_dead(State#state{pto_timer = undefined})};
         false ->
-            %% Handle PTO timeout - send probe packet
+            %% Handle PTO timeout - send probe packet. Flush the socket
+            %% batch: on a silent network this is the only event, and an
+            %% unflushed probe sits in the batch forever - the connection
+            %% then stalls until idle timeout with data in flight.
             NewState = handle_pto_timeout(State#state{pto_timer = undefined}),
-            {keep_state, NewState}
+            {keep_state, flush_dirty_timers(flush_socket_batch(NewState))}
     end;
 handle_common_event(
     info, {disconnect_check, Ref}, StateName, #state{disconnect_timer = Ref} = State
@@ -2579,9 +2587,11 @@ handle_common_event(info, {pto_timeout, _StaleRef}, _StateName, State) ->
 handle_common_event(info, {pacing_timeout, Ref}, connected, #state{pacing_timer = Ref} = State) when
     Ref =/= undefined
 ->
-    %% Handle pacing timeout - process send queue
+    %% Handle pacing timeout - process send queue. Flush like the other
+    %% timer-driven send paths; without it the tail of a paced burst can
+    %% sit in the socket batch until the next inbound event.
     NewState = handle_pacing_timeout(State#state{pacing_timer = undefined}),
-    {keep_state, NewState};
+    {keep_state, flush_dirty_timers(flush_socket_batch(NewState))};
 handle_common_event(info, {pacing_timeout, _StaleRef}, _StateName, State) ->
     %% Ignore stale pacing timer (ref doesn't match or wrong state)
     {keep_state, State};
@@ -2672,7 +2682,8 @@ handle_common_event(
     _StateName,
     #state{server_hs_rtx_timer = Ref, role = server} = State
 ) ->
-    {keep_state, server_hs_retransmit(State#state{server_hs_rtx_timer = undefined})};
+    NewStateHsRtx = server_hs_retransmit(State#state{server_hs_rtx_timer = undefined}),
+    {keep_state, flush_dirty_timers(flush_socket_batch(NewStateHsRtx))};
 handle_common_event(info, {server_hs_rtx, _Stale}, _StateName, State) ->
     {keep_state, State};
 handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
@@ -2769,6 +2780,26 @@ handle_common_event(
         pto_dirty => State#state.pto_dirty,
         pto_count => quic_loss:pto_count(State#state.loss_state),
         in_flight_pns => quic_loss:sent_packet_count(State#state.loss_state),
+        loss => quic_loss:debug_summary(State#state.loss_state),
+        cc =>
+            #{
+                cwnd => quic_cc:cwnd(State#state.cc_state),
+                bytes_in_flight => quic_cc:bytes_in_flight(State#state.cc_state),
+                available => quic_cc:available_cwnd(State#state.cc_state)
+            },
+        pn_next => (State#state.pn_app)#pn_space.next_pn,
+        pn_largest_acked => (State#state.pn_app)#pn_space.largest_acked,
+        pacing_timer => State#state.pacing_timer =/= undefined,
+        sock_stat =>
+            case State#state.socket of
+                undefined ->
+                    undefined;
+                Sock ->
+                    #{
+                        stat => (catch inet:getstat(Sock, [recv_cnt, recv_oct, send_cnt])),
+                        active => (catch inet:getopts(Sock, [active]))
+                    }
+            end,
         socket_os =>
             case State#state.socket_state of
                 undefined -> undefined;
@@ -5546,8 +5577,9 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
 %% HANDSHAKE_DONE: Server confirms handshake complete
 %% RFC 9000 Section 19.20: Only server can send, only in 1-RTT (app level)
 process_frame(app, handshake_done, #state{role = client} = State) ->
-    %% Server confirmed handshake complete (client receiving from server)
-    State;
+    %% Server confirmed handshake complete (client receiving from server).
+    %% The retained Finished flight is no longer needed.
+    State#state{client_hs_flight = undefined};
 process_frame(app, handshake_done, #state{role = server} = State) ->
     %% RFC 9000 §19.20: clients MUST NOT send HANDSHAKE_DONE.
     ?LOG_WARNING(
@@ -6090,12 +6122,29 @@ buffer_crypto_data(Level, Offset, Data, State) ->
                 false ->
                     ok
             end,
+            %% A handshake-level CRYPTO duplicate from offset 0 at a
+            %% client that has sent its Finished means the server's
+            %% flight timer fired: the Finished was lost, and nothing
+            %% retransmits it once the statem has left `handshaking'.
+            %% Resend it (CRYPTO offsets make this idempotent).
+            State0 =
+                case
+                    LevelAtom =:= handshake andalso
+                        State#state.role =:= client andalso
+                        State#state.client_hs_flight =/= undefined andalso
+                        Offset =:= 0 andalso Expected > 0
+                of
+                    true ->
+                        send_handshake_crypto(State#state.client_hs_flight, State);
+                    false ->
+                        State
+                end,
             %% Add data to buffer, keeping the longer chunk if the peer
             %% already sent one at this offset.
             NewBuffer = keep_longest_chunk(Offset, Data, Buffer),
-            NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State#state.crypto_buffer),
+            NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State0#state.crypto_buffer),
 
-            State1 = State#state{crypto_buffer = NewCryptoBuffer},
+            State1 = State0#state{crypto_buffer = NewCryptoBuffer},
 
             %% Try to process contiguous data
             process_crypto_buffer(LevelAtom, State1)
@@ -6644,6 +6693,7 @@ process_tls_message(
                     State1 = State#state{
                         tls_state = ?TLS_HANDSHAKE_COMPLETE,
                         server_flight = undefined,
+                        client_hs_flight = HandshakePayload,
                         tls_transcript = <<Transcript2/binary, ClientFinishedMsg/binary>>,
                         master_secret = MasterSecret,
                         app_keys = {ClientAppKeys, ServerAppKeys},
@@ -11155,7 +11205,13 @@ send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = 
 
     Allowed =
         case Mode of
-            probe -> quic_cc:can_send_control(CCState, PacketSize);
+            %% RFC 9002 §7.5: probe packets are exempt from congestion
+            %% control. Gating them on the 1200-byte control allowance
+            %% deadlocks a full window: bytes_in_flight sits at or just
+            %% above cwnd, every PTO probe is denied, no probe means no
+            %% ACK, no ACK means loss detection never runs, and the
+            %% connection stalls until idle timeout with a full sent_q.
+            probe -> true;
             normal -> quic_cc:can_send(CCState, PacketSize)
         end,
     case Allowed of
@@ -12253,9 +12309,31 @@ maybe_handle_address_change(RemoteAddr, _Data, #state{remote_addr = RemoteAddr} 
 %% RFC 9000 Section 18.2: disable_active_migration only means the RECEIVER should
 %% not migrate to a new local address. It does NOT mean ignore peer address changes.
 %% The check for peer_disable_migration is correctly placed in migrate/1 API only.
-maybe_handle_address_change(NewAddr, DataSize, #state{migration_state = validating_peer} = State) ->
-    %% Already validating a path - update bytes received for anti-amplification
+maybe_handle_address_change(
+    NewAddr,
+    DataSize,
+    #state{
+        migration_state = validating_peer,
+        pending_peer_validation = #path_state{remote_addr = NewAddr}
+    } = State
+) ->
+    %% Already validating this path - update bytes received for anti-amplification
     update_pending_path_bytes_received(NewAddr, DataSize, State);
+maybe_handle_address_change(NewAddr, DataSize, #state{migration_state = validating_peer} = State) ->
+    %% The peer moved again while the previous address was still being
+    %% validated. The pending path is stale: its NAT binding is gone, so
+    %% a PATH_RESPONSE will never arrive and data sent there is lost.
+    %% Restart validation on the newest address instead of ignoring it,
+    %% or the connection stalls until idle timeout under frequent
+    %% rebinding.
+    case detect_peer_address_change(NewAddr, State) of
+        same_path ->
+            State;
+        nat_rebinding ->
+            initiate_peer_path_validation(NewAddr, true, DataSize, State);
+        new_path ->
+            initiate_peer_path_validation(NewAddr, false, DataSize, State)
+    end;
 maybe_handle_address_change(NewAddr, DataSize, State) ->
     %% New address detected - initiate path validation
     case detect_peer_address_change(NewAddr, State) of

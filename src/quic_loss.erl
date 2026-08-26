@@ -29,6 +29,7 @@
 -include("quic.hrl").
 
 -export([
+    debug_summary/1,
     %% Loss detection state
     new/0,
     new/1,
@@ -124,6 +125,29 @@
 
 -opaque loss_state() :: #loss_state{}.
 -export_type([loss_state/0]).
+
+%% Debug introspection for flow-debug dumps.
+-spec debug_summary(loss_state()) -> map().
+debug_summary(#loss_state{sent_q = Q} = S) ->
+    {MinPN, MaxPN} =
+        case queue:peek(Q) of
+            empty ->
+                {undefined, undefined};
+            {value, #sent_packet{pn = First}} ->
+                {value, #sent_packet{pn = Last}} = queue:peek_r(Q),
+                {First, Last}
+        end,
+    #{
+        srtt => S#loss_state.smoothed_rtt,
+        latest_rtt => S#loss_state.latest_rtt,
+        rtt_var => S#loss_state.rtt_var,
+        pto_count => S#loss_state.pto_count,
+        bytes_in_flight => S#loss_state.bytes_in_flight,
+        sent_q_len => queue:len(Q),
+        sent_q_min_pn => MinPN,
+        sent_q_max_pn => MaxPN,
+        loss_time => S#loss_state.loss_time
+    }.
 
 %%====================================================================
 %% Loss Detection State
