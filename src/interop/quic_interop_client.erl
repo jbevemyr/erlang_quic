@@ -358,17 +358,7 @@ collect_loop(Conn, Open, Pending, DownloadsDir, Done, Deadline) ->
         {quic, Conn, {stream_reset, Sid, _Code}} ->
             {Open2, Pending2} = fill_streams(Conn, Pending, maps:remove(Sid, Open), DownloadsDir),
             collect_loop(Conn, Open2, Pending2, DownloadsDir, Done#{Sid => error}, Deadline);
-        {quic, Conn, {closed, Reason}} ->
-            case map_size(Open) of
-                0 ->
-                    ok;
-                _ ->
-                    %% TEMP DEBUG: dump connection state when a close cuts
-                    %% off outstanding downloads.
-                    io:format("STALLDUMP closed=~p open=~p flow=~p~n", [
-                        Reason, map_size(Open), catch gen_statem:call(Conn, get_flow_debug, 800)
-                    ])
-            end,
+        {quic, Conn, {closed, _Reason}} ->
             {close_remaining(Open, Done), Pending}
     after Timeout ->
         case TimeLeft > 0 andalso Pending =/= [] of
