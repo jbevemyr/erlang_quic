@@ -595,11 +595,11 @@ parse_certificate_verify(_) ->
     {error, invalid_certificate_verify}.
 
 %% @doc Parse Finished message.
+%% The verify_data length depends on the negotiated hash (32 for SHA-256,
+%% 48 for SHA-384), so return the whole body and let verification compare.
 -spec parse_finished(binary()) -> {ok, binary()} | {error, term()}.
 parse_finished(VerifyData) when byte_size(VerifyData) >= 32 ->
-    %% SHA-256 produces 32 bytes
-    <<Data:32/binary, _/binary>> = VerifyData,
-    {ok, Data};
+    {ok, VerifyData};
 parse_finished(_) ->
     {error, invalid_finished}.
 
@@ -620,14 +620,21 @@ build_finished(VerifyData) ->
 verify_finished(ReceivedVerifyData, TrafficSecret, TranscriptHash) ->
     FinishedKey = quic_crypto:derive_finished_key(TrafficSecret),
     ExpectedVerifyData = quic_crypto:compute_finished_verify(FinishedKey, TranscriptHash),
-    crypto:hash_equals(ReceivedVerifyData, ExpectedVerifyData).
+    hash_equals(ReceivedVerifyData, ExpectedVerifyData).
 
 %% @doc Verify a Finished message with cipher-specific hash.
 -spec verify_finished(binary(), binary(), binary(), atom()) -> boolean().
 verify_finished(ReceivedVerifyData, TrafficSecret, TranscriptHash, Cipher) ->
     FinishedKey = quic_crypto:derive_finished_key(Cipher, TrafficSecret),
     ExpectedVerifyData = quic_crypto:compute_finished_verify(Cipher, FinishedKey, TranscriptHash),
-    crypto:hash_equals(ReceivedVerifyData, ExpectedVerifyData).
+    hash_equals(ReceivedVerifyData, ExpectedVerifyData).
+
+%% crypto:hash_equals/2 raises badarg on length mismatch; a wrong-length
+%% verify_data is a verification failure, not a crash.
+hash_equals(A, B) when byte_size(A) =:= byte_size(B) ->
+    crypto:hash_equals(A, B);
+hash_equals(_, _) ->
+    false.
 
 %%====================================================================
 %% Transport Parameters
