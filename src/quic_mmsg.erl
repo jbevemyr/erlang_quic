@@ -8,13 +8,33 @@
 -on_load(load/0).
 
 load() ->
-    Path = filename:join(code:priv_dir(quic), "quic_mmsg_nif"),
-    case erlang:load_nif(Path, 0) of
-        ok ->
-            persistent_term:put({?MODULE, loaded}, true),
+    case nif_disabled() of
+        true ->
+            %% Opt-out: available/0 stays false and callers keep the
+            %% per-batch sendmsg path.
             ok;
-        {error, _} ->
-            ok
+        false ->
+            Path = filename:join(code:priv_dir(quic), "quic_mmsg_nif"),
+            case erlang:load_nif(Path, 0) of
+                ok ->
+                    persistent_term:put({?MODULE, loaded}, true),
+                    ok;
+                {error, _} ->
+                    ok
+            end
+    end.
+
+%% Runtime opt-out for benchmarking and fault isolation, read once at
+%% module load: QUIC_DISABLE_MMSG_NIF=1 disables this NIF alone,
+%% QUIC_DISABLE_NIFS=1 disables every optional NIF.
+nif_disabled() ->
+    env_true("QUIC_DISABLE_MMSG_NIF") orelse env_true("QUIC_DISABLE_NIFS").
+
+env_true(Var) ->
+    case os:getenv(Var) of
+        "1" -> true;
+        "true" -> true;
+        _ -> false
     end.
 
 -spec available() -> boolean().
