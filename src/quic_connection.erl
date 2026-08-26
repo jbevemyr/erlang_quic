@@ -4333,10 +4333,14 @@ retransmit_initial_flight(_StateName, State) ->
 %% batched delivery path previously skipped accounting entirely, so a
 %% server's amp budget froze at the first datagram under load and
 %% deferred flights never flushed.
-handle_packets_batch(Packets, State) ->
+handle_packets_batch(Packets, #state{role = server, address_validated = false} = State) ->
     State1 = lists:foldl(fun amp_account_recv/2, State, Packets),
     State2 = do_handle_packets_batch(Packets, State1),
-    amp_flush(State2).
+    amp_flush(State2);
+handle_packets_batch(Packets, State) ->
+    %% amp accounting and deferred-flight flushing are no-ops once the
+    %% address is validated (and always on the client); skip the folds.
+    do_handle_packets_batch(Packets, State).
 
 %% Handle batch of packets from GRO - process all without re-entering gen_statem
 %% This is more efficient than receiving multiple messages
