@@ -199,6 +199,8 @@ open_for_send(RemoteIP, Opts) ->
     Backend = maps:get(backend, Opts, DetectedBackend),
     DetectedGSO = maps:get(gso, Capabilities, false),
     GSOSupported = maps:get(gso, Opts, DetectedGSO),
+    DetectedGRO = maps:get(gro, Capabilities, false),
+    GROSupported = maps:get(gro, Opts, DetectedGRO),
 
     BatchOpts = maps:get(batching, Opts, #{}),
     BatchingEnabled = maps:get(enabled, BatchOpts, true),
@@ -208,6 +210,7 @@ open_for_send(RemoteIP, Opts) ->
         socket ->
             open_send_socket_backend(Family, Opts, #{
                 gso_supported => GSOSupported,
+                gro_supported => GROSupported,
                 batching_enabled => BatchingEnabled,
                 max_batch => MaxBatch
             });
@@ -909,7 +912,16 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
                     count_client_recv_drop(),
                     ok;
                 _ ->
-                    [Owner ! {udp, Socket, IP, Port, Data} || Data <- Packets],
+                    %% A whole GRO train goes as ONE message: with
+                    %% per-packet messages the queue cap above fires
+                    %% long before flow control can pace the sender,
+                    %% and every drop discards a full train.
+                    case Packets of
+                        [Single] ->
+                            Owner ! {udp, Socket, IP, Port, Single};
+                        _ ->
+                            Owner ! {udp_batch, Socket, IP, Port, Packets}
+                    end,
                     ok
             end,
             client_recv_loop(SocketState, Owner);
@@ -1087,12 +1099,18 @@ configure_send_socket(Socket, Opts, BatchConfig) ->
     %% fallback sends, which stalled handshakes and mis-segmented
     %% coalesced Initial+Handshake flights against gen_udp servers.
     GSOEnabled = maps:get(gso_supported, BatchConfig, false),
+    %% Enable GRO so a GSO-batching peer's trains arrive as one
+    %% recvmsg with a UDP_GRO cmsg instead of one syscall per segment;
+    %% recv_gro/2 already handles both shapes.
+    GROEnabled = maybe_enable_gro(Socket, #{
+        gro_supported => maps:get(gro_supported, BatchConfig, false)
+    }),
     State = #socket_state{
         socket = Socket,
         backend = socket,
         owns_socket = true,
         gso_supported = GSOEnabled,
-        gro_enabled = false,
+        gro_enabled = GROEnabled,
         batching_enabled = maps:get(batching_enabled, BatchConfig),
         max_batch_packets = maps:get(max_batch, BatchConfig)
     },

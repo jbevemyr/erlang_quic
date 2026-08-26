@@ -1883,6 +1883,10 @@ idle(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     %% Flush batched packets and timers after processing incoming data
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(idle, FlushedState);
+idle(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Socket} = State) ->
+    NewState = handle_packets_batch(Packets, State),
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    check_state_transition(idle, FlushedState);
 %% Server receives packets from listener
 idle(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
@@ -1980,6 +1984,10 @@ handshaking(
 handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
     %% Flush batched packets and timers after processing incoming data
+    FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+    check_state_transition(handshaking, FlushedState);
+handshaking(info, {udp_batch, Socket, _IP, _Port, Packets}, #state{socket = Socket} = State) ->
+    NewState = handle_packets_batch(Packets, State),
     FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
     check_state_transition(handshaking, FlushedState);
 %% Server receives packets from listener
@@ -2335,6 +2343,16 @@ connected({call, From}, {migrate, _Opts}, #state{remote_addr = RemoteAddr} = Sta
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
+%% Client receives a whole GRO train from the receiver process as one
+%% message; per-packet messages made the receiver's bounded-queue
+%% tail-drop fire long before flow control could pace the sender.
+connected(info, {udp_batch, Socket, IP, Port, Packets}, #state{socket = Socket} = State) ->
+    State1 = State#state{current_packet_source = {IP, Port}, recv_pass = true},
+    NewState = handle_packets_batch(Packets, State1),
+    DrainedState = finish_recv_pass(drain_recv_msgs(NewState, ?RECV_DRAIN_MAX)),
+    FlushedState = flush_dirty_timers(flush_socket_batch(DrainedState)),
+    FinalState = FlushedState#state{current_packet_source = undefined},
+    check_state_transition(connected, FinalState);
 connected(info, {udp, Socket, IP, Port, Data}, #state{socket = Socket} = State) ->
     %% Track packet source for PATH_RESPONSE routing (RFC 9000 Section 8.2.2)
     State1 = State#state{current_packet_source = {IP, Port}, recv_pass = true},
@@ -4554,7 +4572,10 @@ drain_recv_msgs(#state{role = client, socket = Socket} = State, N) ->
             %% GRO train is opened as one batch instead of per message.
             State1 = State#state{current_packet_source = {IP, Port}},
             {Datagrams, Left} = collect_client_udp(Socket, IP, Port, N - 1, [Data]),
-            drain_recv_msgs(handle_packets_batch(Datagrams, State1), Left)
+            drain_recv_msgs(handle_packets_batch(Datagrams, State1), Left);
+        {udp_batch, Socket, IP, Port, Packets} ->
+            State1 = State#state{current_packet_source = {IP, Port}},
+            drain_recv_msgs(handle_packets_batch(Packets, State1), N - 1)
     after 0 ->
         State
     end;
