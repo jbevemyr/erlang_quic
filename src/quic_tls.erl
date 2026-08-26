@@ -1599,7 +1599,7 @@ verify_psk_binder(Secret, Cipher, TruncatedHash, OfferedBinder) ->
     Expected = quic_crypto:compute_psk_binder(
         Cipher, EarlySecret, TruncatedHash, external
     ),
-    crypto:hash_equals(Expected, OfferedBinder).
+    hash_equals(Expected, OfferedBinder).
 
 %% @doc Verify a resumption PSK binder against a parsed ClientHello.
 %% `Secret' is the resumption PSK, `PskBindersInfo' is the `psk_binders'
@@ -1614,7 +1614,7 @@ verify_resumption_binder(Secret, Cipher, FullClientHello, PskBindersInfo, Offere
     Expected = quic_crypto:compute_psk_binder(
         Cipher, EarlySecret, TruncatedHash, resumption
     ),
-    crypto:hash_equals(Expected, OfferedBinder);
+    hash_equals(Expected, OfferedBinder);
 verify_resumption_binder(_Secret, _Cipher, _FullClientHello, _PskBindersInfo, _OfferedBinder) ->
     %% Missing binder offset info — cannot verify, fail closed.
     false.
