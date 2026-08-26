@@ -103,6 +103,10 @@ run_test("multiconnect", RequestsStr, DownloadsDir) ->
     %% handshakeloss and handshakecorruption cases to this testcase
     %% name and counts one handshake per requested file.
     Requests = string:tokens(RequestsStr, " "),
+    %% One connection per file, no retries: the runner counts the exact
+    %% number of handshakes, so every connection must succeed on its
+    %% first (and only) attempt - patience lives in the handshake
+    %% retransmission, not in reconnects.
     Results = lists:append([
         download_all("multiconnect", [R], DownloadsDir)
      || R <- Requests
@@ -205,7 +209,7 @@ wait_connected(Conn, TestCase) ->
         {quic, Conn, {transport_error, Code, Msg}} ->
             io:format("Transport error: ~p ~p~n", [Code, Msg]),
             error
-    after 30000 ->
+    after 60000 ->
         io:format("Connection timeout~n"),
         error
     end.

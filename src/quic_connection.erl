@@ -219,9 +219,12 @@
 %% so it can flush the deferred flight. Backoff doubles from the base up
 %% to the cap. Localhost handshakes complete well under the base, so the
 %% timer is cancelled by the state change and never fires.
--define(HS_RTX_BASE_MS, 500).
--define(HS_RTX_MAX_MS, 4000).
--define(HS_RTX_MAX_ATTEMPTS, 8).
+%% 200 ms base keeps a lossy handshake moving at something closer to
+%% PTO cadence on low-RTT paths; 12 attempts bound the total effort to
+%% roughly half a minute before the connect timeout owns the outcome.
+-define(HS_RTX_BASE_MS, 200).
+-define(HS_RTX_MAX_MS, 3000).
+-define(HS_RTX_MAX_ATTEMPTS, 12).
 
 %% Max send queue size in bytes (16 MB default) - prevents memory exhaustion from queued data
 -define(MAX_SEND_QUEUE_BYTES, 16777216).
@@ -5411,6 +5414,15 @@ process_frame(_Level, ping, State) ->
     State;
 process_frame(Level, {crypto, Offset, Data}, State) ->
     buffer_crypto_data(Level, Offset, Data, State);
+process_frame(Level, {ack, _Ranges, _AckDelay, _ECN}, State) when Level =/= app ->
+    %% Initial/Handshake ACKs must never touch the loss tracker: only
+    %% 1-RTT packets are registered there, and packet numbers restart
+    %% per space, so a Handshake-space ACK of PN 0..N silently "acks"
+    %% the first N 1-RTT packets out of sent_q. If those carried data
+    %% the peer never received, nothing retransmits them and the peer
+    %% stalls on a permanent stream hole. Handshake flights have their
+    %% own replay-based retransmission.
+    State;
 process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
     %% Process ACK - update loss detection and congestion control
     #state{loss_state = LossState, cc_state = CCState} = State,
@@ -12750,9 +12762,18 @@ complete_migration(
     NewPMTUState = quic_pmtu:on_path_change(PMTUState),
 
     %% RFC 9002 Section 9.4: Reset congestion controller on path change
-    %% The new path may have different RTT and bandwidth characteristics
-    NewCCState = quic_cc:new(#{}),
-    NewLossState = quic_loss:new(),
+    %% The new path may have different RTT and bandwidth characteristics.
+    %% The loss tracker's sent_q must SURVIVE the switch: replacing it
+    %% orphans every in-flight packet (no ACK match, no loss detection,
+    %% no PTO since bytes_in_flight reads 0) and their data is never
+    %% retransmitted - the peer then stalls on a permanent stream hole.
+    NewLossState = quic_loss:reset_for_new_path(State#state.loss_state),
+    NewCCState0 = quic_cc:new(#{}),
+    NewCCState =
+        case quic_loss:bytes_in_flight(NewLossState) of
+            0 -> NewCCState0;
+            Outstanding -> quic_cc:on_packets_sent(NewCCState0, [Outstanding])
+        end,
 
     State#state{
         remote_addr = NewPath#path_state.remote_addr,
@@ -12763,7 +12784,8 @@ complete_migration(
         pmtu_raise_timer = undefined,
         %% Reset CC and loss detection for new path
         cc_state = NewCCState,
-        loss_state = NewLossState
+        loss_state = NewLossState,
+        pto_dirty = true
     };
 complete_migration(_, State) ->
     %% Can only migrate to validated paths
