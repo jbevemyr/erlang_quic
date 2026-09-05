@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- AEAD sealing and opening reuse a cipher context instead of re-running
+  the key schedule on every packet. `crypto:crypto_one_time_aead/7` sets
+  the key up on each call and QUIC seals each packet as its own AEAD
+  unit, so that cost landed on every packet in both directions. Where
+  the running OTP has `crypto_one_time_aead_init/4` (OTP 28+) the handle
+  is cached per key and direction, bounded the way the header-protection
+  contexts already are; older releases keep the one-shot path. Measured
+  on a 1200-byte packet: AES-128-GCM seal 0.540 to 0.331 us and open
+  0.468 to 0.331, ChaCha20-Poly1305 seal 1.132 to 0.934 and open 1.067
+  to 0.934. A payload too short to hold an authentication tag is now
+  rejected as an authentication failure rather than raising.
+
 ## [1.8.2] - 2026-09-05
 
 ### Added
