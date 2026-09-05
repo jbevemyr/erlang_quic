@@ -642,9 +642,22 @@ dispatch_batched_packets(
                     ConnPid, lists:reverse(PacketList), RemoteAddr, QueueMax
                 );
             ({new, DCID, Version}, PacketList) ->
-                %% Initial packets that need new connections
-                [FirstPacket | _] = lists:reverse(PacketList),
-                create_connection(FirstPacket, DCID, Version, RemoteAddr, State)
+                %% Initial packets that need new connections. A client
+                %% flight larger than one datagram (a hybrid
+                %% x25519mlkem768 ClientHello is chunked across
+                %% Initials) arrives as several packets for the same
+                %% unknown DCID: the first starts the connection, the
+                %% rest have to reach it too or the handshake stalls
+                %% until the client retransmits them.
+                [FirstPacket | Rest] = lists:reverse(PacketList),
+                case create_connection(FirstPacket, DCID, Version, RemoteAddr, State) of
+                    {ok, ConnPid} when Rest =/= [] ->
+                        send_packets_to_connection(ConnPid, Rest, RemoteAddr, QueueMax);
+                    _ ->
+                        %% Retry sent, limit reached or start failed:
+                        %% the client resends the whole flight.
+                        ok
+                end
         end,
         Groups
     ).

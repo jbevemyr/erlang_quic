@@ -55,6 +55,13 @@ All notable changes to this project will be documented in this file.
   for new connections.
 
 ### Fixed
+- A client Initial flight spanning more than one datagram reaches the
+  connection in full. The listener's receive sweep groups the packets
+  of one flight together, and the group that starts a new connection
+  handed only its first packet over, dropping the rest; the handshake
+  then stalled until the client retransmitted. A chunked
+  `x25519mlkem768` ClientHello makes a multi-datagram flight the normal
+  case, and the sweep put this on the default `gen_udp` path.
 - Pacing no longer freezes on sub-millisecond links. RTT samples are
   whole milliseconds, so such a link reports a smoothed RTT of 0 and
   `update_pacing_rate` treated that as "no RTT yet" and skipped the
