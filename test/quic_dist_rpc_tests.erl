@@ -253,26 +253,50 @@ test_rpc_cast({#{peer1 := Peer1, peer2 := Peer2, node2 := Node2}, _TmpDir}) ->
             after 5000 ->
                 put(cast_result, timeout)
             end,
-            %% Keep alive for a bit so we can check
-            timer:sleep(1000)
+            %% Stay alive past the polling below; the node is torn
+            %% down at the end of the case either way.
+            timer:sleep(30000)
         end
     ]),
 
     %% Cast from Node1 to Node2
     true = peer:call(Peer1, rpc, cast, [Node2, erlang, send, [ReceiverPid, {cast_test, TestRef}]]),
 
-    %% Wait a bit and check the result
-    timer:sleep(200),
-    Result = peer:call(Peer2, erlang, apply, [
-        fun(Pid) -> rpc:call(node(Pid), erlang, process_info, [Pid, dictionary]) end,
-        [ReceiverPid]
-    ]),
-    case Result of
+    %% A cast is asynchronous, so poll for the receiver to record it
+    %% rather than sleeping a fixed 200 ms and hoping that was enough:
+    %% a loaded runner loses that race. The budget stays under eunit's
+    %% 5 s per-test timeout so an exhausted poll fails as `timed_out'
+    %% instead of being cancelled, and a receiver that has vanished no
+    %% longer passes the case by falling through.
+    ?assertEqual({got_cast, TestRef}, await_cast_result(Peer2, ReceiverPid, 30)).
+
+await_cast_result(_Peer, _Pid, 0) ->
+    timed_out;
+await_cast_result(Peer, Pid, Tries) ->
+    %% The peer call itself can fail while the node is busy or the
+    %% receiver is gone; that is a retry, not a reason to abandon the
+    %% case with an exception.
+    Info =
+        try
+            peer:call(Peer, erlang, apply, [
+                fun(P) -> rpc:call(node(P), erlang, process_info, [P, dictionary]) end,
+                [Pid]
+            ])
+        catch
+            _:_ -> unavailable
+        end,
+    case Info of
         {dictionary, Dict} ->
-            ?assertEqual({got_cast, TestRef}, proplists:get_value(cast_result, Dict));
+            case proplists:get_value(cast_result, Dict) of
+                undefined ->
+                    timer:sleep(100),
+                    await_cast_result(Peer, Pid, Tries - 1);
+                Value ->
+                    Value
+            end;
         _ ->
-            %% Process might have exited, check differently
-            ok
+            timer:sleep(100),
+            await_cast_result(Peer, Pid, Tries - 1)
     end.
 
 %% Test RPC multicall
