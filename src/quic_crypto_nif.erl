@@ -34,6 +34,11 @@
 ]).
 -on_load(load/0).
 
+%% Never fails: an on_load that returns anything but ok makes the
+%% module unloadable, and every caller then dies with undef instead of
+%% taking the pure-Erlang path. code:priv_dir/1 answers {error, _} when
+%% the app is not resolvable (an escript bundle, a bare code path), so
+%% it has to be matched rather than passed to filename:join/2.
 load() ->
     case nif_disabled() of
         true ->
@@ -41,12 +46,11 @@ load() ->
             %% false and quic_crypto uses OTP crypto.
             ok;
         false ->
-            So = filename:join(code:priv_dir(quic), "quic_crypto_nif"),
-            case erlang:load_nif(So, 0) of
-                ok ->
+            case code:priv_dir(quic) of
+                {error, _} ->
                     ok;
-                {error, _Reason} ->
-                    %% Fallback path: same as the opt-out.
+                Dir ->
+                    _ = erlang:load_nif(filename:join(Dir, "quic_crypto_nif"), 0),
                     ok
             end
     end.
