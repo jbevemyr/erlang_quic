@@ -55,6 +55,14 @@ All notable changes to this project will be documented in this file.
   for new connections.
 
 ### Fixed
+- The NIF's AEAD context cache is bounded and no longer raises. Each
+  key update derives fresh keys, and the per-process cache kept a live
+  EVP context for every one of them, so a long-lived bulk connection
+  accumulated them until it exited; only the current and previous key
+  phase are ever live (RFC 9001 section 6), so the oldest are now
+  evicted. A context the NIF cannot build also falls back to the OTP
+  crypto path instead of failing a `{ok, Ctx}` match, which is what the
+  optional NIF is supposed to guarantee.
 - A client Initial flight spanning more than one datagram reaches the
   connection in full. The listener's receive sweep groups the packets
   of one flight together, and the group that starts a new connection

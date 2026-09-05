@@ -23,16 +23,23 @@
 ]).
 
 -define(TAG_LEN, 16).
+%% Current and previous key phase, encrypt and decrypt, plus the two
+%% header-protection contexts, which do not rotate on a key update.
+-define(MAX_CACHED_CTX, 6).
 
 %% @doc Seal: returns Ciphertext||Tag.
 -spec aead_encrypt(atom(), binary(), binary(), binary(), binary()) -> binary().
 aead_encrypt(Cipher, Key, Nonce, Plaintext, AAD) ->
     case nif_enabled() of
         true ->
-            Ctx = ctx(qc_enc, Cipher, Key),
-            case quic_crypto_nif:seal(Ctx, Nonce, AAD, Plaintext) of
-                Out when is_binary(Out) -> Out;
-                {error, _} -> fallback_encrypt(Cipher, Key, Nonce, Plaintext, AAD)
+            case ctx(qc_enc, Cipher, Key) of
+                {ok, Ctx} ->
+                    case quic_crypto_nif:seal(Ctx, Nonce, AAD, Plaintext) of
+                        Out when is_binary(Out) -> Out;
+                        {error, _} -> fallback_encrypt(Cipher, Key, Nonce, Plaintext, AAD)
+                    end;
+                error ->
+                    fallback_encrypt(Cipher, Key, Nonce, Plaintext, AAD)
             end;
         false ->
             fallback_encrypt(Cipher, Key, Nonce, Plaintext, AAD)
@@ -44,11 +51,15 @@ aead_encrypt(Cipher, Key, Nonce, Plaintext, AAD) ->
 aead_decrypt(Cipher, Key, Nonce, Ciphertext, AAD, Tag) ->
     case nif_enabled() of
         true ->
-            Ctx = ctx(qc_dec, Cipher, Key),
-            case quic_crypto_nif:open(Ctx, Nonce, AAD, Ciphertext, Tag) of
-                Out when is_binary(Out) -> Out;
-                error -> error;
-                {error, _} -> fallback_decrypt(Cipher, Key, Nonce, Ciphertext, AAD, Tag)
+            case ctx(qc_dec, Cipher, Key) of
+                {ok, Ctx} ->
+                    case quic_crypto_nif:open(Ctx, Nonce, AAD, Ciphertext, Tag) of
+                        Out when is_binary(Out) -> Out;
+                        error -> error;
+                        {error, _} -> fallback_decrypt(Cipher, Key, Nonce, Ciphertext, AAD, Tag)
+                    end;
+                error ->
+                    fallback_decrypt(Cipher, Key, Nonce, Ciphertext, AAD, Tag)
             end;
         false ->
             fallback_decrypt(Cipher, Key, Nonce, Ciphertext, AAD, Tag)
@@ -59,10 +70,14 @@ aead_decrypt(Cipher, Key, Nonce, Ciphertext, AAD, Tag) ->
 hp_block(Cipher, Key, Sample) ->
     case nif_enabled() of
         true ->
-            Ctx = hp_ctx(Cipher, Key),
-            case quic_crypto_nif:hp_block(Ctx, Sample) of
-                Out when is_binary(Out) -> Out;
-                {error, _} -> quic_aead:ecb_mask(Cipher, Key, Sample)
+            case hp_ctx(Cipher, Key) of
+                {ok, Ctx} ->
+                    case quic_crypto_nif:hp_block(Ctx, Sample) of
+                        Out when is_binary(Out) -> Out;
+                        {error, _} -> quic_aead:ecb_mask(Cipher, Key, Sample)
+                    end;
+                error ->
+                    quic_aead:ecb_mask(Cipher, Key, Sample)
             end;
         false ->
             quic_aead:ecb_mask(Cipher, Key, Sample)
@@ -88,15 +103,18 @@ protect_run(chacha20_poly1305, _Key, _IV, _HP, _PN0, _FirstByteBase, _DCID, _Pay
 protect_run(Cipher, Key, IV, HP, PN0, FirstByteBase, DCID, Payloads) ->
     case nif_enabled() of
         true ->
-            AeadCtx = ctx(qc_enc, Cipher, Key),
-            HpCtx = hp_ctx(hp_ecb_cipher(Cipher), HP),
-            case
-                quic_crypto_nif:protect_run(
-                    AeadCtx, HpCtx, IV, PN0, FirstByteBase, DCID, Payloads
-                )
-            of
-                Packets when is_list(Packets) -> {ok, Packets};
-                {error, _} -> fallback
+            case {ctx(qc_enc, Cipher, Key), hp_ctx(hp_ecb_cipher(Cipher), HP)} of
+                {{ok, AeadCtx}, {ok, HpCtx}} ->
+                    case
+                        quic_crypto_nif:protect_run(
+                            AeadCtx, HpCtx, IV, PN0, FirstByteBase, DCID, Payloads
+                        )
+                    of
+                        Packets when is_list(Packets) -> {ok, Packets};
+                        {error, _} -> fallback
+                    end;
+                _ ->
+                    fallback
             end;
         false ->
             fallback
@@ -177,7 +195,10 @@ with_open_ctx(Cipher, Key, HP, LargestRecv, Fun) ->
                     undefined -> -1;
                     _ -> LargestRecv
                 end,
-            Fun(ctx(qc_dec, Cipher, Key), hp_ctx(hp_ecb_cipher(Cipher), HP), Largest);
+            case {ctx(qc_dec, Cipher, Key), hp_ctx(hp_ecb_cipher(Cipher), HP)} of
+                {{ok, DecCtx}, {ok, HpCtx}} -> Fun(DecCtx, HpCtx, Largest);
+                _ -> fallback
+            end;
         false ->
             fallback
     end.
@@ -211,23 +232,49 @@ nif_enabled() ->
 %% keys (current + previous key phase per direction); stale entries
 %% from key updates are few and die with the process.
 ctx(Kind, Cipher, Key) ->
-    PdKey = {Kind, Cipher, Key},
-    case erlang:get(PdKey) of
-        undefined ->
-            {ok, Ctx} = quic_crypto_nif:new_aead_ctx(Cipher, Key, Kind =:= qc_enc),
-            erlang:put(PdKey, Ctx),
-            Ctx;
-        Ctx ->
-            Ctx
-    end.
+    cached({Kind, Cipher, Key}, fun() ->
+        quic_crypto_nif:new_aead_ctx(Cipher, Key, Kind =:= qc_enc)
+    end).
 
 hp_ctx(Cipher, Key) ->
-    PdKey = {qc_hp, Cipher, Key},
+    cached({qc_hp, Cipher, Key}, fun() -> quic_crypto_nif:new_hp_ctx(Cipher, Key) end).
+
+%% Look the context up, creating it on a miss. A creation failure
+%% returns `error' rather than raising: every caller then takes the OTP
+%% crypto path, which is the point of the NIF being optional.
+cached(PdKey, New) ->
     case erlang:get(PdKey) of
         undefined ->
-            {ok, Ctx} = quic_crypto_nif:new_hp_ctx(Cipher, Key),
-            erlang:put(PdKey, Ctx),
-            Ctx;
+            case New() of
+                {ok, Ctx} ->
+                    erlang:put(PdKey, Ctx),
+                    retain(PdKey),
+                    {ok, Ctx};
+                {error, _} ->
+                    error
+            end;
         Ctx ->
-            Ctx
+            {ok, Ctx}
+    end.
+
+%% Bound the cache. RFC 9001 section 6 keeps at most the current and
+%% previous key phase live, but a key update fires every
+%% ?AEAD_CONFIDENTIALITY_LIMIT packets and derives fresh keys each
+%% time, so without eviction a long-lived bulk connection accumulates
+%% one live EVP context per update. Evicting the oldest only costs
+%% recreating it if it is asked for again.
+retain(PdKey) ->
+    Prev =
+        case erlang:get(qc_ctx_live) of
+            undefined -> [];
+            L -> L
+        end,
+    Live = [PdKey | lists:delete(PdKey, Prev)],
+    case length(Live) > ?MAX_CACHED_CTX of
+        true ->
+            {Keep, [Evict]} = lists:split(?MAX_CACHED_CTX, Live),
+            erlang:erase(Evict),
+            erlang:put(qc_ctx_live, Keep);
+        false ->
+            erlang:put(qc_ctx_live, Live)
     end.
