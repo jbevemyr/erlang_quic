@@ -157,6 +157,47 @@ jobs:
           QUIC_ENABLE_GSO_TEST: "1"
         run: rebar3 ct --suite=quic_server_batching_SUITE
 
+  crypto-nif:
+    name: Crypto NIF
+    needs: unit-tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24.0'
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev
+
+      - name: Compile
+        run: rebar3 compile
+
+      # The NIF tests skip themselves when it is not loaded, so a green
+      # run proves nothing unless the build is known to have produced
+      # it. Fail loudly here instead.
+      - name: Assert the NIF is loaded
+        run: |
+          test -f priv/quic_crypto_nif.so || { echo "NIF was not built"; exit 1; }
+          rebar3 as test compile
+          erl -noshell -pa _build/test/lib/quic/ebin -eval '
+            application:ensure_all_started(quic),
+            case quic_crypto_nif:is_loaded() of
+              true -> halt(0);
+              false -> io:format("NIF built but not loaded~n"), halt(1)
+            end.'
+
+      - name: Run tests with the NIF
+        run: rebar3 eunit
+
+      - name: Run tests with the NIF disabled
+        env:
+          QUIC_DISABLE_CRYPTO_NIF: "1"
+        run: rebar3 eunit
+
   dist:
     name: Distribution Tests
     needs: unit-tests
