@@ -29,6 +29,9 @@
 -dialyzer([no_match]).
 
 -export([
+    ecb_mask/3,
+    otp_seal/5,
+    otp_open/5,
     encrypt/5,
     encrypt/6,
     decrypt/5,
@@ -244,11 +247,10 @@ cipher_for_key(Key) when byte_size(Key) =:= 32 -> aes_256_gcm.
 %% Compute header protection mask
 compute_hp_mask(aes_128_gcm, HP, Sample) ->
     %% AES-ECB encryption of sample
-    ecb_mask(aes_128_ecb, HP, Sample);
+    quic_aead_ctx:hp_block(aes_128_ecb, HP, Sample);
 compute_hp_mask(aes_256_gcm, HP, Sample) ->
-    %% AES-ECB encryption of sample (use first 16 bytes of 32-byte key)
-    %% Actually, HP for AES-256 is 32 bytes, use aes_256_ecb
-    ecb_mask(aes_256_ecb, HP, Sample);
+    %% HP for AES-256 is 32 bytes, use aes_256_ecb
+    quic_aead_ctx:hp_block(aes_256_ecb, HP, Sample);
 compute_hp_mask(chacha20_poly1305, HP, Sample) ->
     %% ChaCha20 with counter=0 and the sample as nonce
     %% Sample is 16 bytes: first 4 = counter, last 12 = nonce
@@ -270,17 +272,33 @@ compute_hp_mask(chacha20_poly1305, HP, Sample) ->
 %% single-entry cache makes them evict each other and re-runs the key
 %% schedule anyway. Both are kept, and a key update (a third key) drops
 %% the pair rather than letting the cache grow.
+%% Header-protection block on a cached ECB context (the pure-Erlang
+%% path; quic_aead_ctx:hp_block/3 falls back to this without the NIF).
 ecb_mask(Cipher, Key, Sample) ->
     crypto:crypto_update(ecb_ctx(Cipher, Key), Sample).
 
 %% @private
-%% Seal one packet, returning Ciphertext||Tag.
+%% Seal one packet, returning Ciphertext||Tag. Tries the optional
+%% crypto NIF first; otp_seal/5 below is what it degrades to.
+aead_seal(Cipher, Key, Nonce, AAD, Plaintext) ->
+    quic_aead_ctx:aead_encrypt(Cipher, Key, Nonce, Plaintext, AAD).
+
+%% @private
+%% Open one packet, taking Ciphertext||Tag and returning the plaintext
+%% or `error'. Same layering as aead_seal/5.
+aead_open(Cipher, Key, Nonce, AAD, CiphertextWithTag) ->
+    quic_aead_ctx:aead_decrypt(Cipher, Key, Nonce, CiphertextWithTag, AAD).
+
+%% @private
+%% Seal on OTP crypto alone, with a reusable cipher context where the
+%% running release has one. Reached from quic_aead_ctx when the NIF is
+%% absent, so it must not call back into it.
 %%
 %% crypto:crypto_one_time_aead/7 re-runs the key schedule on every
 %% call, and QUIC seals each packet as its own AEAD unit, so that cost
 %% lands on every packet. crypto_one_time_aead_init/4 (OTP 28+) returns
 %% a handle usable across nonces; without it this is the old one-shot.
-aead_seal(Cipher, Key, Nonce, AAD, Plaintext) ->
+otp_seal(Cipher, Key, Nonce, AAD, Plaintext) ->
     case aead_ctx(Cipher, Key, true) of
         undefined ->
             {Ciphertext, Tag} = crypto:crypto_one_time_aead(
@@ -292,15 +310,15 @@ aead_seal(Cipher, Key, Nonce, AAD, Plaintext) ->
     end.
 
 %% @private
-%% Open one packet. Takes Ciphertext||Tag and returns the plaintext or
-%% `error'. Input too short to hold a tag is rejected here: the context
+%% Open on OTP crypto alone. Takes Ciphertext||Tag and returns the
+%% plaintext or `error'. Input too short to hold a tag is rejected here: the context
 %% API raises on it, and splitting it by hand would fail the binary
 %% match, so neither path may be handed one.
-aead_open(_Cipher, _Key, _Nonce, _AAD, CiphertextWithTag) when
+otp_open(_Cipher, _Key, _Nonce, _AAD, CiphertextWithTag) when
     byte_size(CiphertextWithTag) < ?TAG_LEN
 ->
     error;
-aead_open(Cipher, Key, Nonce, AAD, CiphertextWithTag) ->
+otp_open(Cipher, Key, Nonce, AAD, CiphertextWithTag) ->
     case aead_ctx(Cipher, Key, false) of
         undefined ->
             CipherLen = byte_size(CiphertextWithTag) - ?TAG_LEN,
@@ -314,7 +332,7 @@ aead_open(Cipher, Key, Nonce, AAD, CiphertextWithTag) ->
 %% direction are live across a key update, a third drops the pair.
 %% `undefined' means the running OTP has no context API.
 aead_ctx(Cipher, Key, Enc) ->
-    case aead_ctx_api() of
+    case aead_ctx_api() andalso byte_size(Key) =:= aead_key_len(Cipher) of
         false ->
             undefined;
         true ->
@@ -338,6 +356,15 @@ aead_ctx(Cipher, Key, Enc) ->
                     Ctx
             end
     end.
+
+%% crypto:crypto_one_time_aead_init/4 does not check the key length and
+%% takes the emulator down on a wrong one, where the one-shot raises
+%% badarg. Keep the context path to lengths we have checked ourselves,
+%% so a bad key fails the same way it always did.
+aead_key_len(aes_128_gcm) -> 16;
+aead_key_len(aes_256_gcm) -> 32;
+aead_key_len(chacha20_poly1305) -> 32;
+aead_key_len(_) -> undefined.
 
 %% OTP 28+. Checked through module_info so the lookup loads crypto
 %% rather than answering false because it is not loaded yet, and cached

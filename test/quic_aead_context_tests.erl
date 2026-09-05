@@ -17,12 +17,16 @@ keylen(aes_128_gcm) -> 16;
 keylen(aes_256_gcm) -> 32;
 keylen(chacha20_poly1305) -> 32.
 
+%% Both helpers pin the NIF off: it sits above the OTP path and would
+%% answer first, leaving the two OTP paths under test unreached.
 with_context() ->
     erlang:erase(),
+    erlang:put(qc_nif, false),
     ok.
 
 with_fallback() ->
     erlang:erase(),
+    erlang:put(qc_nif, false),
     erlang:put(aead_ctx_api, false),
     ok.
 

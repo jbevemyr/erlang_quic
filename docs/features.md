@@ -284,6 +284,7 @@ ok = quic:reset_stream_at(Conn, StreamId, ErrorCode, byte_size(Header)).
 - `ack_packet_tolerance` - Ack-eliciting packets received before a 1-RTT ACK is sent, the RFC 9000 section 13.2.1 decimation threshold (default: 2)
 - `disconnect_timeout` - Milliseconds without a response from the peer before the connection is given up on, checked on its own timer (default: 16000)
 - `pmtu_raise_interval` - Milliseconds between PMTU raise probes (default: 600000)
+- `delivery_coalescing` - Merge consecutive same-stream `stream_data` deliveries of one receive pass into a single owner message (default: `false`). Arrival order across streams is preserved and a `stream_reset` never overtakes data delivered before it, but an owner that counts messages rather than bytes sees fewer of them
 
 ### PMTU Discovery
 - `quic:get_mtu/1` - Get current effective MTU for a connection

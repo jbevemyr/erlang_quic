@@ -67,6 +67,48 @@ receive side. In no particular order:
 The full list, one commit per bullet, is in `CHANGELOG.md` under
 the 1.2.0 entry.
 
+## The crypto NIF is optional
+
+`c_src/quic_crypto_nif.c` is an accelerator, not a dependency. QUIC
+seals every packet as its own AEAD unit and OTP's
+`crypto:crypto_one_time_aead/7` re-runs the key schedule on each call;
+the NIF keeps an `EVP_CIPHER_CTX` per key so the schedule runs once,
+and fuses header protection, nonce derivation, packet-number
+reconstruction and (on receive) frame parsing into one call per run.
+
+You never have to build it. When it is missing the library uses the
+OTP crypto path with identical semantics, so the only difference is
+throughput.
+
+Build it with a C toolchain, CMake and OpenSSL headers present:
+
+```sh
+rebar3 compile          # the pre_hook builds it when it can
+```
+
+CMake resolves the ERTS headers and the same libcrypto OTP's own
+crypto NIF is linked against, so loading it never pins a second
+OpenSSL into the VM. Verified on Linux, macOS (arm64, OpenSSL from
+MacPorts or Homebrew) and FreeBSD 14.3 (arm64, base OpenSSL). A
+missing toolchain prints a note and the build succeeds:
+
+```
+quic_crypto_nif: build skipped (no cmake, toolchain or OpenSSL headers?), using pure-Erlang crypto path
+```
+
+Turn it off at runtime without rebuilding:
+
+```sh
+QUIC_DISABLE_CRYPTO_NIF=1    # this NIF only
+QUIC_DISABLE_NIFS=1          # every optional NIF
+```
+
+Two limits worth knowing. ChaCha20-Poly1305 connections keep only the
+per-packet acceleration, since the fused paths assume AES-ECB header
+protection. And `erlang:load_nif/2` looks under `code:priv_dir(quic)`,
+so a packaging layout where that does not resolve falls back to the
+OTP crypto path rather than failing.
+
 ## The socket backend is opt in, for now
 
 Version 1.2.0 adds a `socket_backend => socket` option on
