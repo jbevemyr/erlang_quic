@@ -30,6 +30,8 @@
 
 -export([
     ecb_mask/3,
+    otp_seal/5,
+    otp_open/5,
     encrypt/5,
     encrypt/6,
     decrypt/5,
@@ -90,7 +92,7 @@ encrypt(Key, IV, PN, AAD, Plaintext) ->
     binary().
 encrypt(Key, IV, PN, AAD, Plaintext, Cipher) ->
     Nonce = compute_nonce(IV, PN),
-    quic_aead_ctx:aead_encrypt(Cipher, Key, Nonce, Plaintext, AAD).
+    aead_seal(Cipher, Key, Nonce, AAD, Plaintext).
 
 %% @doc Decrypt a QUIC packet payload using AEAD.
 %%
@@ -107,9 +109,7 @@ decrypt(Key, IV, PN, AAD, CiphertextWithTag) ->
     {ok, binary()} | {error, bad_tag}.
 decrypt(Key, IV, PN, AAD, CiphertextWithTag, Cipher) ->
     Nonce = compute_nonce(IV, PN),
-    CipherLen = byte_size(CiphertextWithTag) - ?TAG_LEN,
-    <<Ciphertext:CipherLen/binary, Tag:?TAG_LEN/binary>> = CiphertextWithTag,
-    case quic_aead_ctx:aead_decrypt(Cipher, Key, Nonce, Ciphertext, AAD, Tag) of
+    case aead_open(Cipher, Key, Nonce, AAD, CiphertextWithTag) of
         Plaintext when is_binary(Plaintext) ->
             {ok, Plaintext};
         error ->
@@ -277,6 +277,108 @@ compute_hp_mask(chacha20_poly1305, HP, Sample) ->
 ecb_mask(Cipher, Key, Sample) ->
     crypto:crypto_update(ecb_ctx(Cipher, Key), Sample).
 
+%% @private
+%% Seal one packet, returning Ciphertext||Tag. Tries the optional
+%% crypto NIF first; otp_seal/5 below is what it degrades to.
+aead_seal(Cipher, Key, Nonce, AAD, Plaintext) ->
+    quic_aead_ctx:aead_encrypt(Cipher, Key, Nonce, Plaintext, AAD).
+
+%% @private
+%% Open one packet, taking Ciphertext||Tag and returning the plaintext
+%% or `error'. Same layering as aead_seal/5.
+aead_open(Cipher, Key, Nonce, AAD, CiphertextWithTag) ->
+    quic_aead_ctx:aead_decrypt(Cipher, Key, Nonce, CiphertextWithTag, AAD).
+
+%% @private
+%% Seal on OTP crypto alone, with a reusable cipher context where the
+%% running release has one. Reached from quic_aead_ctx when the NIF is
+%% absent, so it must not call back into it.
+%%
+%% crypto:crypto_one_time_aead/7 re-runs the key schedule on every
+%% call, and QUIC seals each packet as its own AEAD unit, so that cost
+%% lands on every packet. crypto_one_time_aead_init/4 (OTP 28+) returns
+%% a handle usable across nonces; without it this is the old one-shot.
+otp_seal(Cipher, Key, Nonce, AAD, Plaintext) ->
+    case aead_ctx(Cipher, Key, true) of
+        undefined ->
+            {Ciphertext, Tag} = crypto:crypto_one_time_aead(
+                Cipher, Key, Nonce, Plaintext, AAD, ?TAG_LEN, true
+            ),
+            <<Ciphertext/binary, Tag/binary>>;
+        Ctx ->
+            crypto:crypto_one_time_aead(Ctx, Nonce, Plaintext, AAD)
+    end.
+
+%% @private
+%% Open on OTP crypto alone. Takes Ciphertext||Tag and returns the
+%% plaintext or `error'. Input too short to hold a tag is rejected here: the context
+%% API raises on it, and splitting it by hand would fail the binary
+%% match, so neither path may be handed one.
+otp_open(_Cipher, _Key, _Nonce, _AAD, CiphertextWithTag) when
+    byte_size(CiphertextWithTag) < ?TAG_LEN
+->
+    error;
+otp_open(Cipher, Key, Nonce, AAD, CiphertextWithTag) ->
+    case aead_ctx(Cipher, Key, false) of
+        undefined ->
+            CipherLen = byte_size(CiphertextWithTag) - ?TAG_LEN,
+            <<Ciphertext:CipherLen/binary, Tag:?TAG_LEN/binary>> = CiphertextWithTag,
+            crypto:crypto_one_time_aead(Cipher, Key, Nonce, Ciphertext, AAD, Tag, false);
+        Ctx ->
+            crypto:crypto_one_time_aead(Ctx, Nonce, CiphertextWithTag, AAD)
+    end.
+
+%% Same caching shape and rationale as ecb_ctx/2: two keys per
+%% direction are live across a key update, a third drops the pair.
+%% `undefined' means the running OTP has no context API.
+aead_ctx(Cipher, Key, Enc) ->
+    case aead_ctx_api() andalso byte_size(Key) =:= aead_key_len(Cipher) of
+        false ->
+            undefined;
+        true ->
+            CacheKey = {aead_ctx, Cipher, Enc},
+            Cache =
+                case erlang:get(CacheKey) of
+                    undefined -> #{};
+                    M -> M
+                end,
+            case Cache of
+                #{Key := Ctx} ->
+                    Ctx;
+                _ ->
+                    Ctx = crypto:crypto_one_time_aead_init(Cipher, Key, ?TAG_LEN, Enc),
+                    Kept =
+                        case map_size(Cache) >= 2 of
+                            true -> #{};
+                            false -> Cache
+                        end,
+                    erlang:put(CacheKey, Kept#{Key => Ctx}),
+                    Ctx
+            end
+    end.
+
+%% crypto:crypto_one_time_aead_init/4 does not check the key length and
+%% takes the emulator down on a wrong one, where the one-shot raises
+%% badarg. Keep the context path to lengths we have checked ourselves,
+%% so a bad key fails the same way it always did.
+aead_key_len(aes_128_gcm) -> 16;
+aead_key_len(aes_256_gcm) -> 32;
+aead_key_len(chacha20_poly1305) -> 32;
+aead_key_len(_) -> undefined.
+
+%% OTP 28+. Checked through module_info so the lookup loads crypto
+%% rather than answering false because it is not loaded yet, and cached
+%% because this is on the per-packet path.
+aead_ctx_api() ->
+    case erlang:get(aead_ctx_api) of
+        undefined ->
+            V = lists:member({crypto_one_time_aead_init, 4}, crypto:module_info(exports)),
+            erlang:put(aead_ctx_api, V),
+            V;
+        V ->
+            V
+    end.
+
 ecb_ctx(Cipher, Key) ->
     Cache =
         case erlang:get({hp_ctx, Cipher}) of
@@ -394,7 +496,7 @@ protect_long_packet(Cipher, Key, IV, HP, PN, HeaderPrefix, Plaintext) ->
 protect_packet_common(Cipher, Key, IV, HP, PN, HeaderPrefix, PNBin, Plaintext) ->
     AAD = <<HeaderPrefix/binary, PNBin/binary>>,
     Nonce = compute_nonce(IV, PN),
-    EncryptedPayload = quic_aead_ctx:aead_encrypt(Cipher, Key, Nonce, Plaintext, AAD),
+    EncryptedPayload = aead_seal(Cipher, Key, Nonce, AAD, Plaintext),
     PNOffset = byte_size(HeaderPrefix),
     ProtectedHeader = protect_header(Cipher, HP, AAD, EncryptedPayload, PNOffset),
     <<ProtectedHeader/binary, EncryptedPayload/binary>>.
@@ -470,9 +572,7 @@ unprotect_packet_common(Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRe
 
             %% Decrypt
             Nonce = compute_nonce(IV, PN),
-            CipherLen = byte_size(Ciphertext) - ?TAG_LEN,
-            <<CiphertextOnly:CipherLen/binary, Tag:?TAG_LEN/binary>> = Ciphertext,
-            case quic_aead_ctx:aead_decrypt(Cipher, Key, Nonce, CiphertextOnly, AAD, Tag) of
+            case aead_open(Cipher, Key, Nonce, AAD, Ciphertext) of
                 Plaintext when is_binary(Plaintext) ->
                     {ok, PN, UnprotectedHeader, Plaintext};
                 error ->
@@ -564,9 +664,7 @@ decrypt_short_payload(
 
     %% Decrypt
     Nonce = compute_nonce(IV, PN),
-    CipherLen = byte_size(Ciphertext) - ?TAG_LEN,
-    <<CiphertextOnly:CipherLen/binary, Tag:?TAG_LEN/binary>> = Ciphertext,
-    case quic_aead_ctx:aead_decrypt(Cipher, Key, Nonce, CiphertextOnly, AAD, Tag) of
+    case aead_open(Cipher, Key, Nonce, AAD, Ciphertext) of
         Plaintext when is_binary(Plaintext) ->
             {ok, PN, Plaintext};
         error ->

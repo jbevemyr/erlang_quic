@@ -15,7 +15,7 @@
 
 -export([
     aead_encrypt/5,
-    aead_decrypt/6,
+    aead_decrypt/5,
     hp_block/3,
     protect_run/8,
     open_packet/8,
@@ -45,24 +45,33 @@ aead_encrypt(Cipher, Key, Nonce, Plaintext, AAD) ->
             fallback_encrypt(Cipher, Key, Nonce, Plaintext, AAD)
     end.
 
-%% @doc Open: Ciphertext WITHOUT tag + Tag; returns Plaintext | error.
--spec aead_decrypt(atom(), binary(), binary(), binary(), binary(), binary()) ->
+%% @doc Open: takes Ciphertext||Tag; returns Plaintext | error. The
+%% whole thing is passed in so the length check lives in one place:
+%% both the NIF and the OTP path need the tag split off, and neither
+%% may be handed input too short to hold one.
+-spec aead_decrypt(atom(), binary(), binary(), binary(), binary()) ->
     binary() | error.
-aead_decrypt(Cipher, Key, Nonce, Ciphertext, AAD, Tag) ->
+aead_decrypt(_Cipher, _Key, _Nonce, CiphertextWithTag, _AAD) when
+    byte_size(CiphertextWithTag) < ?TAG_LEN
+->
+    error;
+aead_decrypt(Cipher, Key, Nonce, CiphertextWithTag, AAD) ->
     case nif_enabled() of
         true ->
+            CipherLen = byte_size(CiphertextWithTag) - ?TAG_LEN,
+            <<Ciphertext:CipherLen/binary, Tag:?TAG_LEN/binary>> = CiphertextWithTag,
             case ctx(qc_dec, Cipher, Key) of
                 {ok, Ctx} ->
                     case quic_crypto_nif:open(Ctx, Nonce, AAD, Ciphertext, Tag) of
                         Out when is_binary(Out) -> Out;
                         error -> error;
-                        {error, _} -> fallback_decrypt(Cipher, Key, Nonce, Ciphertext, AAD, Tag)
+                        {error, _} -> fallback_decrypt(Cipher, Key, Nonce, CiphertextWithTag, AAD)
                     end;
                 error ->
-                    fallback_decrypt(Cipher, Key, Nonce, Ciphertext, AAD, Tag)
+                    fallback_decrypt(Cipher, Key, Nonce, CiphertextWithTag, AAD)
             end;
         false ->
-            fallback_decrypt(Cipher, Key, Nonce, Ciphertext, AAD, Tag)
+            fallback_decrypt(Cipher, Key, Nonce, CiphertextWithTag, AAD)
     end.
 
 %% @doc One ECB block for AES header protection (mask source).
@@ -207,14 +216,13 @@ with_open_ctx(Cipher, Key, HP, LargestRecv, Fun) ->
 %% Internal
 %%====================================================================
 
+%% Without the NIF, OTP crypto still reuses a cipher context where the
+%% running release has one; quic_aead owns that so this cannot recurse.
 fallback_encrypt(Cipher, Key, Nonce, Plaintext, AAD) ->
-    {Ciphertext, Tag} = crypto:crypto_one_time_aead(
-        Cipher, Key, Nonce, Plaintext, AAD, ?TAG_LEN, true
-    ),
-    <<Ciphertext/binary, Tag/binary>>.
+    quic_aead:otp_seal(Cipher, Key, Nonce, AAD, Plaintext).
 
-fallback_decrypt(Cipher, Key, Nonce, Ciphertext, AAD, Tag) ->
-    crypto:crypto_one_time_aead(Cipher, Key, Nonce, Ciphertext, AAD, Tag, false).
+fallback_decrypt(Cipher, Key, Nonce, CiphertextWithTag, AAD) ->
+    quic_aead:otp_open(Cipher, Key, Nonce, AAD, CiphertextWithTag).
 
 %% Cache the NIF-availability flag per process: checked on every
 %% packet, and a process dictionary read beats a NIF call.

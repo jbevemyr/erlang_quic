@@ -32,8 +32,10 @@ cache_stays_bounded_across_key_updates_test() ->
             fun(_) ->
                 Key = crypto:strong_rand_bytes(16),
                 _ = quic_aead_ctx:aead_encrypt(aes_128_gcm, Key, ?IV, <<"payload">>, <<>>),
+                %% Ciphertext||Tag: long enough to hold a tag so the
+                %% decrypt context is actually built.
                 _ = quic_aead_ctx:aead_decrypt(
-                    aes_128_gcm, Key, ?IV, <<"xxxxxxx">>, <<>>, <<0:128>>
+                    aes_128_gcm, Key, ?IV, <<0:(23 * 8)>>, <<>>
                 )
             end,
             lists:seq(1, 200)
