@@ -258,6 +258,55 @@ jobs:
           QUIC_DISABLE_CRYPTO_NIF: "1"
         run: rebar3 eunit
 
+  crypto-nif-fuzz:
+    name: Crypto NIF Fuzz (ASan)
+    needs: unit-tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24.0'
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev
+
+      # Compile first: the rebar pre_hook builds the NIF, and the ASan
+      # build below has to be the one left in priv/.
+      - name: Compile
+        run: rebar3 as test compile
+
+      - name: Rebuild the NIF with AddressSanitizer
+        run: |
+          rm -rf c_src/build priv/quic_crypto_nif.so
+          cmake -S c_src -B c_src/build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-fsanitize=address"
+          cmake --build c_src/build
+          test -f priv/quic_crypto_nif.so || { echo "NIF was not built"; exit 1; }
+
+      # open_run parses frames in C from plaintext the peer controls, so
+      # this is the one place attacker input reaches a hand-written
+      # parser. ASan aborts the emulator on a finding, which fails the
+      # step. Leak detection is off: the BEAM is not leak-clean and its
+      # allocations are not what is under test.
+      - name: Fuzz the in-NIF frame parser
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+        run: |
+          erlc -o _build/test/lib/quic/test test/quic_nif_fuzz.erl
+          LD_PRELOAD=$(gcc -print-file-name=libasan.so) \
+            erl -noshell -pa _build/test/lib/quic/ebin -pa _build/test/lib/quic/test -eval '
+              application:ensure_all_started(quic),
+              case quic_crypto_nif:is_loaded() of
+                false -> io:format("NIF not loaded, nothing fuzzed~n"), halt(1);
+                true -> quic_nif_fuzz:run(200000), halt(0)
+              end.'
+
   dist:
     name: Distribution Tests
     needs: unit-tests

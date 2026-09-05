@@ -64,11 +64,12 @@ protect(Plain) ->
 %% truncations, and deeply nested length fields.
 payload() ->
     Base =
-        case rand:uniform(4) of
+        case rand:uniform(5) of
             1 -> noise(rand:uniform(1200));
             2 -> frames(rand:uniform(8));
             3 -> truncate(frames(rand:uniform(6)));
-            4 -> corrupt(frames(rand:uniform(6)))
+            4 -> corrupt(frames(rand:uniform(6)));
+            5 -> many_frames(rand:uniform(96))
         end,
     %% keep protect_run happy (needs sampling room)
     <<0:(64 * 8), Base/binary>>.
@@ -78,6 +79,20 @@ noise(Len) ->
 
 frames(N) ->
     iolist_to_binary([quic_frame:encode(frame()) || _ <- lists:seq(1, N)]).
+
+%% Single-byte frames only, so the count crosses the parser's
+%% PF_MAX_FRAMES cap (64) without the packet growing out of proportion.
+%% The other shapes top out at 8 frames and never reach the array bound,
+%% which left the one fixed-size buffer in the parser unexercised.
+many_frames(N) ->
+    iolist_to_binary([quic_frame:encode(small_frame()) || _ <- lists:seq(1, N)]).
+
+small_frame() ->
+    case rand:uniform(3) of
+        1 -> ping;
+        2 -> handshake_done;
+        3 -> {max_data, rand:uniform(1000000)}
+    end.
 
 frame() ->
     case rand:uniform(9) of
