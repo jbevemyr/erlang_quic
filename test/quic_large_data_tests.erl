@@ -291,7 +291,7 @@ loss_rtt_calculation_under_load_test() ->
         fun(N, Acc) ->
             S1 = quic_loss:on_packet_sent(Acc, N, 100, true),
             timer:sleep(1),
-            Now = erlang:monotonic_time(millisecond),
+            Now = erlang:monotonic_time(microsecond),
             AckFrame = {ack, N, 0, 0, []},
             {S2, _, _, _} = quic_loss:on_ack_received(S1, AckFrame, Now),
             S2

@@ -97,9 +97,11 @@
 -define(HYSTART_CSS_ROUNDS, 5).
 %% Dynamic RTT threshold bounds (RFC 9406)
 %% Minimum RTT threshold in milliseconds
--define(HYSTART_MIN_RTT_THRESH, 4).
+%% Smallest RTT the pacer computes a rate from, microseconds.
+-define(PACING_MIN_RTT_US, 100).
+-define(HYSTART_MIN_RTT_THRESH, 4000).
 %% Maximum RTT threshold in milliseconds
--define(HYSTART_MAX_RTT_THRESH, 16).
+-define(HYSTART_MAX_RTT_THRESH, 16000).
 %% Divisor for baseline RTT to calculate dynamic threshold
 -define(HYSTART_MIN_RTT_DIVISOR, 8).
 
@@ -803,10 +805,11 @@ on_persistent_congestion(#cubic_state{cwnd = Cwnd, minimum_window = MinimumWindo
 
 %% @doc Update pacing rate based on smoothed RTT.
 -spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
-update_pacing_rate(#cubic_state{cwnd = Cwnd} = State, SmoothedRTT) when SmoothedRTT > 0 ->
+update_pacing_rate(#cubic_state{cwnd = Cwnd} = State, SmoothedRTTUs) when SmoothedRTTUs > 0 ->
+    SmoothedRTT = max(?PACING_MIN_RTT_US, SmoothedRTTUs),
     %% pacing_rate stored as milli-bytes per microsecond for precision with us timestamps
     %% Formula: (cwnd * 1.25 * 1000) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
-    PacingRate = max(1, (Cwnd * 1250) div (SmoothedRTT * 1000)),
+    PacingRate = max(1, (Cwnd * 1250) div SmoothedRTT),
 
     %% Update HyStart++ RTT tracking
     State1 = update_hystart_rtt(State, SmoothedRTT),

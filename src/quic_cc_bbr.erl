@@ -121,9 +121,9 @@
 -define(HYSTART_MIN_SAMPLES, 8).
 %% Dynamic RTT threshold bounds (RFC 9406)
 %% Minimum RTT threshold in milliseconds
--define(HYSTART_MIN_RTT_THRESH, 4).
+-define(HYSTART_MIN_RTT_THRESH, 4000).
 %% Maximum RTT threshold in milliseconds
--define(HYSTART_MAX_RTT_THRESH, 16).
+-define(HYSTART_MAX_RTT_THRESH, 16000).
 %% Divisor for baseline RTT to calculate dynamic threshold
 -define(HYSTART_MIN_RTT_DIVISOR, 8).
 
@@ -552,14 +552,10 @@ detect_persistent_congestion(LostPackets, PTO, _State) ->
 %% Note: BBR primarily uses its own pacing_rate calculation,
 %% but this callback allows external RTT info integration.
 -spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
-update_pacing_rate(State, SmoothedRTT) when SmoothedRTT > 0 ->
-    %% SmoothedRTT is ms from quic_loss; convert to µs internally.
+update_pacing_rate(State, SmoothedRTTUs) when SmoothedRTTUs > 0 ->
     Now = erlang:monotonic_time(microsecond),
-    RttUs = SmoothedRTT * 1000,
-    State1 = update_min_rtt(State, RttUs, Now),
-    %% HyStart++ threshold math is expressed in ms in RFC 9406 —
-    %% keep the hystart tracker ms-based.
-    update_hystart_rtt(State1, SmoothedRTT);
+    State1 = update_min_rtt(State, SmoothedRTTUs, Now),
+    update_hystart_rtt(State1, SmoothedRTTUs);
 update_pacing_rate(State, _SmoothedRTT) ->
     State.
 

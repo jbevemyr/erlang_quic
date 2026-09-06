@@ -85,9 +85,11 @@
 -define(HYSTART_CSS_ROUNDS, 5).
 %% Dynamic RTT threshold bounds (RFC 9406)
 %% Minimum RTT threshold in milliseconds
--define(HYSTART_MIN_RTT_THRESH, 4).
+%% Smallest RTT the pacer computes a rate from, microseconds.
+-define(PACING_MIN_RTT_US, 100).
+-define(HYSTART_MIN_RTT_THRESH, 4000).
 %% Maximum RTT threshold in milliseconds
--define(HYSTART_MAX_RTT_THRESH, 16).
+-define(HYSTART_MAX_RTT_THRESH, 16000).
 %% Divisor for baseline RTT to calculate dynamic threshold
 -define(HYSTART_MIN_RTT_DIVISOR, 8).
 
@@ -902,17 +904,20 @@ on_persistent_congestion(#cc_state{cwnd = Cwnd, minimum_window = MinimumWindow} 
 %% RFC 9002: pacing_rate = cwnd / smoothed_rtt
 %% Called when RTT estimate is updated.
 -spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
-update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTT0) ->
+update_pacing_rate(#cc_state{cwnd = Cwnd} = State, SmoothedRTTUs) ->
     %% RTT samples are whole milliseconds, so a sub-millisecond link
     %% reports 0. Skipping the update then freezes the rate at its
     %% handshake-time value while cwnd keeps growing, clocking the
     %% connection at that stale rate forever. Floor at 1 ms so the
     %% rate keeps tracking cwnd and the congestion controller governs.
-    SmoothedRTT = max(1, SmoothedRTT0),
+    %% Microseconds. Floored at ?PACING_MIN_RTT_US: below that the rate
+    %% only says "unpaced", and a zero sample on a coarse clock must not
+    %% divide by zero.
+    SmoothedRTT = max(?PACING_MIN_RTT_US, SmoothedRTTUs),
     %% pacing_rate stored as milli-bytes per microsecond for precision with us timestamps
     %% Formula: (cwnd * 1.25 * 1000) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
     %% Simplified: (cwnd * 5 * 250) / (RTT_ms * 1000) = (cwnd * 1250) / (RTT_ms * 1000)
-    PacingRate = max(1, (Cwnd * 1250) div (SmoothedRTT * 1000)),
+    PacingRate = max(1, (Cwnd * 1250) div SmoothedRTT),
 
     ?LOG_DEBUG(
         #{

@@ -22,7 +22,8 @@
 
 %% Must match quic_loss.
 -define(TIME_THRESHOLD, 1.125).
--define(GRANULARITY, 1).
+%% Microseconds, as quic_loss keeps its clock.
+-define(GRANULARITY, 1000).
 
 %% Arbitrary fixed send time, in the monotonic milliseconds
 %% on_packet_sent/6 expects.
@@ -46,8 +47,8 @@ applied_delay(State) ->
     ?assertNotEqual(undefined, LossTime),
     LossTime - ?SENT_AT.
 
-expected_delay(Rtt) ->
-    max(trunc(?TIME_THRESHOLD * Rtt), ?GRANULARITY).
+expected_delay(RttUs) ->
+    max(trunc(?TIME_THRESHOLD * RttUs), ?GRANULARITY).
 
 %%====================================================================
 %% RTT bookkeeping these tests depend on
@@ -71,8 +72,8 @@ decay_leaves_smoothed_above_latest_test() ->
 
 delay_follows_latest_rtt_when_it_exceeds_smoothed_test() ->
     State = with_inflight_packet(samples(quic_loss:new(), [20, 400])),
-    SRTT = quic_loss:smoothed_rtt(State),
-    Latest = quic_loss:latest_rtt(State),
+    SRTT = quic_loss:smoothed_rtt_us(State),
+    Latest = quic_loss:latest_rtt_us(State),
     ?assertEqual(expected_delay(Latest), applied_delay(State)),
     %% Explicitly not the smoothed-only value, which is what an
     %% EWMA-only threshold would produce.
@@ -80,8 +81,8 @@ delay_follows_latest_rtt_when_it_exceeds_smoothed_test() ->
 
 delay_follows_smoothed_rtt_when_it_exceeds_latest_test() ->
     State = with_inflight_packet(samples(quic_loss:new(), [400, 20])),
-    SRTT = quic_loss:smoothed_rtt(State),
-    Latest = quic_loss:latest_rtt(State),
+    SRTT = quic_loss:smoothed_rtt_us(State),
+    Latest = quic_loss:latest_rtt_us(State),
     ?assertEqual(expected_delay(SRTT), applied_delay(State)),
     ?assertNotEqual(expected_delay(Latest), applied_delay(State)).
 
@@ -91,7 +92,7 @@ delay_equals_both_when_rtt_is_stable_test() ->
     State = with_inflight_packet(samples(quic_loss:new(), [50, 50, 50])),
     ?assertEqual(50, quic_loss:latest_rtt(State)),
     ?assertEqual(50, quic_loss:smoothed_rtt(State)),
-    ?assertEqual(expected_delay(50), applied_delay(State)).
+    ?assertEqual(expected_delay(50000), applied_delay(State)).
 
 delay_floors_at_granularity_test() ->
     %% A zero RTT sample must still leave a floor of one granularity

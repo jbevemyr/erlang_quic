@@ -29,10 +29,10 @@
 %%====================================================================
 
 %% Three ack-eliciting 1-RTT packets in flight. The send times are real
-%% monotonic milliseconds because processing an application ACK arms the
+%% monotonic microseconds because processing an application ACK arms the
 %% PTO timer, and a timestamp far in the past yields a negative delay.
 loss_with_three_inflight() ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     S0 = quic_loss:new(),
     S1 = quic_loss:on_packet_sent(S0, 0, ?PACKET_BYTES, true, [], Now),
     S2 = quic_loss:on_packet_sent(S1, 1, ?PACKET_BYTES, true, [], Now + 1),

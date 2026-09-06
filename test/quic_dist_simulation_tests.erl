@@ -486,7 +486,7 @@ pacing_prevents_burst_loss_test() ->
     CCState = quic_cc:new(#{initial_window => 65536}),
 
     %% Set up pacing with 50ms RTT
-    CC1 = quic_cc:update_pacing_rate(CCState, 50),
+    CC1 = quic_cc:update_pacing_rate(CCState, 50000),
 
     %% Try to send burst of 64KB
     {AllowedBurst, CC2} = quic_cc:get_pacing_tokens(CC1, 65536),

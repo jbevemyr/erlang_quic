@@ -431,6 +431,8 @@
 %% Kernel limits on a single UDP_SEGMENT write: UDP_MAX_SEGMENTS segments,
 %% and a payload that still fits a 16-bit UDP length. A run larger than
 %% either is split across writes.
+%% Smallest RTT the pacer computes a rate from, microseconds.
+-define(PACING_MIN_RTT_US, 100).
 -define(MAX_GSO_SEGMENTS, 64).
 -define(MAX_GSO_PAYLOAD, 65535).
 

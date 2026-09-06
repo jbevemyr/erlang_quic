@@ -2331,16 +2331,16 @@ connected(
     %% microseconds. Convert at read time so the underlying state
     %% stays untouched. min_rtt is `infinity' before the first sample
     %% lands; surface it as 0 so callers can rely on non_neg_integer.
-    MinRttMs =
-        case quic_loss:min_rtt(LossState) of
+    MinRttUs =
+        case quic_loss:min_rtt_us(LossState) of
             infinity -> 0;
             M -> M
         end,
     Stats = #{
-        srtt => quic_loss:smoothed_rtt(LossState) * 1000,
-        latest_rtt => quic_loss:latest_rtt(LossState) * 1000,
-        min_rtt => MinRttMs * 1000,
-        rtt_var => quic_loss:rtt_var(LossState) * 1000,
+        srtt => quic_loss:smoothed_rtt_us(LossState),
+        latest_rtt => quic_loss:latest_rtt_us(LossState),
+        min_rtt => MinRttUs,
+        rtt_var => quic_loss:rtt_var_us(LossState),
         cwnd => Cwnd,
         bytes_in_flight => InFlight,
         in_recovery => InRecovery,
@@ -4018,7 +4018,7 @@ send_app_packet_now(Payload, Frames, State0) ->
             %% so coalesced packets with multiple frames are handled.
             AckEliciting = contains_ack_eliciting_frames(Frames),
             NewLossState = quic_loss:on_packet_sent(
-                LossState, PN, PacketSize, AckEliciting, Frames, Now
+                LossState, PN, PacketSize, AckEliciting, Frames, erlang:monotonic_time(microsecond)
             ),
             NewCCState =
                 case AckEliciting of
@@ -5535,7 +5535,9 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
             AckFrame = {ack, LargestAcked, AckDelay, FirstRange, RestRanges},
 
             Now = erlang:monotonic_time(millisecond),
-            case quic_loss:on_ack_received(LossState, AckFrame, Now) of
+            case
+                quic_loss:on_ack_received(LossState, AckFrame, erlang:monotonic_time(microsecond))
+            of
                 {error, ack_range_too_large} ->
                     %% RFC 9000: Invalid ACK range is a protocol violation
                     ?LOG_ERROR(#{what => invalid_ack_range}, ?QUIC_LOG_META),
@@ -5543,10 +5545,16 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                 {NewLossState, AckedPackets, LostPackets, AckMeta} ->
                     %% Use pre-computed metadata from quic_loss (avoids redundant scanning)
                     AckedBytes = maps:get(acked_bytes, AckMeta, 0),
-                    LargestAckedSentTime = maps:get(largest_ae_time, AckMeta, Now),
+                    %% Sent times come back in microseconds; the controllers
+                    %% keep their recovery clock in milliseconds.
+                    LargestAckedSentTime = maps:get(largest_ae_time, AckMeta, Now * 1000) div 1000,
                     HasAckEliciting = maps:get(has_ack_eliciting, AckMeta, false),
                     LostBytes = maps:get(lost_bytes, AckMeta, 0),
-                    LargestLostSentTime = maps:get(largest_lost_sent_time, AckMeta, undefined),
+                    LargestLostSentTime =
+                        case maps:get(largest_lost_sent_time, AckMeta, undefined) of
+                            undefined -> undefined;
+                            LostUs -> LostUs div 1000
+                        end,
 
                     %% Only update CC ACK processing if there are ack-eliciting packets
                     %% When only non-ack-eliciting packets are ACKed, skip on_packets_acked
@@ -5584,8 +5592,9 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     CCState6 =
                         case quic_loss:has_rtt_sample(NewLossState) of
                             true ->
-                                SmoothedRTT = quic_loss:smoothed_rtt(NewLossState),
-                                quic_cc:update_pacing_rate(CCState5, SmoothedRTT);
+                                quic_cc:update_pacing_rate(
+                                    CCState5, quic_loss:smoothed_rtt_us(NewLossState)
+                                );
                             false ->
                                 CCState5
                         end,
@@ -8285,7 +8294,8 @@ check_persistent_congestion([], _LossState, CCState) ->
     CCState;
 check_persistent_congestion(LostPackets, LossState, CCState) ->
     %% Extract packet number and time sent from lost packets
-    LostInfo = [{P#sent_packet.pn, P#sent_packet.time_sent} || P <- LostPackets],
+    %% Sent times are microseconds; the controller compares them with the ms PTO.
+    LostInfo = [{P#sent_packet.pn, P#sent_packet.time_sent div 1000} || P <- LostPackets],
     PTO = quic_loss:get_pto(LossState),
     case quic_cc:detect_persistent_congestion(LostInfo, PTO, CCState) of
         true ->
@@ -9344,9 +9354,13 @@ send_zero_rtt_packet(Payload, Frames, EarlyKeys, State) ->
     %% loss detection like any 1-RTT packet: a dropped 0-RTT request was
     %% otherwise never retransmitted and the stream hung forever (RFC
     %% 9001 §4.1.1 expects lost 0-RTT data to be resent).
-    Now = erlang:monotonic_time(millisecond),
     NewLossState = quic_loss:on_packet_sent(
-        State#state.loss_state, PN, byte_size(Packet), true, Frames, Now
+        State#state.loss_state,
+        PN,
+        byte_size(Packet),
+        true,
+        Frames,
+        erlang:monotonic_time(microsecond)
     ),
     NewCCState = quic_cc:on_packet_sent(State#state.cc_state, byte_size(Packet)),
 
@@ -9783,7 +9797,9 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
             _ ->
                 Tracked = lists:reverse(TrackedRev),
                 {
-                    quic_loss:on_packets_sent_run(LossState, Tracked, Now),
+                    quic_loss:on_packets_sent_run(
+                        LossState, Tracked, erlang:monotonic_time(microsecond)
+                    ),
                     quic_cc:on_packets_sent(CCState, [Sz || {_, Sz, _} <- Tracked])
                 }
         end,

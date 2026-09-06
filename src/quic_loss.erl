@@ -55,6 +55,10 @@
     rtt_var/1,
     latest_rtt/1,
     min_rtt/1,
+    smoothed_rtt_us/1,
+    rtt_var_us/1,
+    latest_rtt_us/1,
+    min_rtt_us/1,
 
     %% PTO
     get_pto/1,
@@ -75,9 +79,13 @@
 -define(TIME_THRESHOLD, 1.125).
 % 1 millisecond
 -define(MAX_PTO_MS, 5000).
--define(GRANULARITY, 1).
+-define(MAX_PTO_US, ?MAX_PTO_MS * 1000).
+%% Timer granularity, microseconds (RFC 9002 kGranularity = 1 ms).
+-define(GRANULARITY, 1000).
 % RFC 9002 default is 333ms, but 100ms is more aggressive for faster ramp-up
--define(DEFAULT_INITIAL_RTT, 100).
+%% Microseconds. All times inside this module are microseconds; the
+%% exported ms accessors round for callers that arm ms timers.
+-define(DEFAULT_INITIAL_RTT, 100000).
 
 %% Loss detection state.
 %%
@@ -158,11 +166,11 @@ new() ->
 %%   - initial_rtt: Initial RTT estimate in ms (default: 100ms)
 -spec new(map()) -> loss_state().
 new(Opts) ->
-    InitialRTT = maps:get(initial_rtt, Opts, ?DEFAULT_INITIAL_RTT),
+    InitialRTT = ms_to_us(maps:get(initial_rtt, Opts, ?DEFAULT_INITIAL_RTT div 1000)),
     #loss_state{
         smoothed_rtt = InitialRTT,
         rtt_var = InitialRTT div 2,
-        max_ack_delay = maps:get(max_ack_delay, Opts, ?DEFAULT_MAX_ACK_DELAY)
+        max_ack_delay = ms_to_us(maps:get(max_ack_delay, Opts, ?DEFAULT_MAX_ACK_DELAY))
     }.
 
 %%====================================================================
@@ -181,7 +189,7 @@ on_packet_sent(State, PacketNumber, Size, AckEliciting) ->
 -spec on_packet_sent(loss_state(), non_neg_integer(), non_neg_integer(), boolean(), [term()]) ->
     loss_state().
 on_packet_sent(State, PacketNumber, Size, AckEliciting, Frames) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     on_packet_sent(State, PacketNumber, Size, AckEliciting, Frames, Now).
 
 %% @doc Like on_packet_sent/5 but uses the caller-supplied monotonic
@@ -380,9 +388,10 @@ classify_ack_head(Q, LargestAcked, Ranges, AckedAcc, KeptAcc, AckedBytes, MaxAE)
 maybe_update_rtt(State, LargestAcked, AckedList, AckDelay, Now) ->
     case lists:keyfind(LargestAcked, #sent_packet.pn, AckedList) of
         #sent_packet{ack_eliciting = true, time_sent = TS} ->
-            LatestRTT = Now - TS,
-            AckDelayMs = ack_delay_to_ms(AckDelay, State),
-            update_rtt(State, LatestRTT, AckDelayMs);
+            %% A clock that stepped between send and ACK yields a negative
+            %% sample; treat it as zero rather than feeding it to the EWMA.
+            LatestRTT = max(0, Now - TS),
+            update_rtt_us(State, LatestRTT, ack_delay_to_us(AckDelay, State));
         _ ->
             State
     end.
@@ -400,7 +409,7 @@ detect_lost_packets(
     #loss_state{sent_q = Q, smoothed_rtt = SRTT, latest_rtt = LatestRTT} = State,
     LargestAcked
 ) ->
-    Now = erlang:monotonic_time(millisecond),
+    Now = erlang:monotonic_time(microsecond),
     SentList = queue:to_list(Q),
     %% RFC 9002 §6.1.2: the time threshold uses max(smoothed_rtt,
     %% latest_rtt). With the EWMA alone, an RTT spike that outruns it
@@ -508,7 +517,12 @@ earliest_in_flight_time([_ | Rest]) -> earliest_in_flight_time(Rest).
 
 %% @doc Update RTT estimates with a new sample.
 -spec update_rtt(loss_state(), non_neg_integer(), non_neg_integer()) -> loss_state().
-update_rtt(#loss_state{first_rtt_sample = false} = State, LatestRTT, _AckDelay) ->
+%% Exported in milliseconds for callers and tests that reason in ms;
+%% on_ack_received feeds microsecond samples through update_rtt_us/3.
+update_rtt(State, LatestRTTMs, AckDelayMs) ->
+    update_rtt_us(State, ms_to_us(LatestRTTMs), ms_to_us(AckDelayMs)).
+
+update_rtt_us(#loss_state{first_rtt_sample = false} = State, LatestRTT, _AckDelay) ->
     %% First RTT sample
     State#loss_state{
         latest_rtt = LatestRTT,
@@ -517,7 +531,7 @@ update_rtt(#loss_state{first_rtt_sample = false} = State, LatestRTT, _AckDelay) 
         min_rtt = LatestRTT,
         first_rtt_sample = true
     };
-update_rtt(
+update_rtt_us(
     #loss_state{
         smoothed_rtt = SRTT,
         rtt_var = RTTVAR,
@@ -551,20 +565,34 @@ update_rtt(
     }.
 
 %% @doc Get the smoothed RTT.
+%% Milliseconds, rounded down; the _us accessors return the exact value.
 -spec smoothed_rtt(loss_state()) -> non_neg_integer().
-smoothed_rtt(#loss_state{smoothed_rtt = SRTT}) -> SRTT.
+smoothed_rtt(#loss_state{smoothed_rtt = SRTT}) -> SRTT div 1000.
+
+-spec smoothed_rtt_us(loss_state()) -> non_neg_integer().
+smoothed_rtt_us(#loss_state{smoothed_rtt = SRTT}) -> SRTT.
 
 %% @doc Get the RTT variance.
 -spec rtt_var(loss_state()) -> non_neg_integer().
-rtt_var(#loss_state{rtt_var = RTTVAR}) -> RTTVAR.
+rtt_var(#loss_state{rtt_var = RTTVAR}) -> RTTVAR div 1000.
+
+-spec rtt_var_us(loss_state()) -> non_neg_integer().
+rtt_var_us(#loss_state{rtt_var = RTTVAR}) -> RTTVAR.
 
 %% @doc Get the latest RTT sample.
 -spec latest_rtt(loss_state()) -> non_neg_integer().
-latest_rtt(#loss_state{latest_rtt = L}) -> L.
+latest_rtt(#loss_state{latest_rtt = L}) -> L div 1000.
+
+-spec latest_rtt_us(loss_state()) -> non_neg_integer().
+latest_rtt_us(#loss_state{latest_rtt = L}) -> L.
 
 %% @doc Get the minimum RTT.
 -spec min_rtt(loss_state()) -> non_neg_integer() | infinity.
-min_rtt(#loss_state{min_rtt = M}) -> M.
+min_rtt(#loss_state{min_rtt = infinity}) -> infinity;
+min_rtt(#loss_state{min_rtt = M}) -> M div 1000.
+
+-spec min_rtt_us(loss_state()) -> non_neg_integer() | infinity.
+min_rtt_us(#loss_state{min_rtt = M}) -> M.
 
 %%====================================================================
 %% Probe Timeout (RFC 9002 Section 6.2)
@@ -586,7 +614,7 @@ get_pto(#loss_state{
     %% peer's patience is a probe that never happened. Probes are tiny,
     %% so a bounded worst-case interval costs nothing while keeping
     %% recovery inside real-world request timeouts.
-    min(PTO bsl PTOCount, ?MAX_PTO_MS).
+    us_to_ms_ceil(min(PTO bsl PTOCount, ?MAX_PTO_US)).
 
 %% @doc Handle PTO expiration.
 -spec on_pto_expired(loss_state()) -> loss_state().
@@ -616,9 +644,15 @@ pto_count(#loss_state{pto_count = C}) -> C.
 %% last received ACK, or the start of the current outstanding burst,
 %% whichever is later. undefined until either has happened.
 -spec last_progress(loss_state()) -> non_neg_integer() | undefined.
-last_progress(#loss_state{time_of_last_ack = undefined, outstanding_since = O}) -> O;
-last_progress(#loss_state{time_of_last_ack = A, outstanding_since = undefined}) -> A;
-last_progress(#loss_state{time_of_last_ack = A, outstanding_since = O}) -> max(A, O).
+%% Milliseconds on the monotonic clock, for the disconnect timer.
+last_progress(#loss_state{time_of_last_ack = undefined, outstanding_since = undefined}) ->
+    undefined;
+last_progress(#loss_state{time_of_last_ack = undefined, outstanding_since = O}) ->
+    O div 1000;
+last_progress(#loss_state{time_of_last_ack = A, outstanding_since = undefined}) ->
+    A div 1000;
+last_progress(#loss_state{time_of_last_ack = A, outstanding_since = O}) ->
+    max(A, O) div 1000.
 
 %% @doc Get the oldest unacked packet (for PTO probe selection).
 %% Returns {ok, #sent_packet{}} or none. Head of the sent queue is
@@ -667,10 +701,10 @@ pn_in_ranges(PN, [_Range | Rest]) ->
     pn_in_ranges(PN, Rest).
 
 %% Convert encoded ACK delay to milliseconds
-ack_delay_to_ms(AckDelay, #loss_state{}) ->
+ack_delay_to_us(AckDelay, #loss_state{}) ->
     %% AckDelay is in microseconds after shifting by ack_delay_exponent
     %% Using default exponent of 3
-    (AckDelay bsl ?DEFAULT_ACK_DELAY_EXPONENT) div 1000.
+    AckDelay bsl ?DEFAULT_ACK_DELAY_EXPONENT.
 
 %%====================================================================
 %% Retransmission Helpers
@@ -714,3 +748,7 @@ is_retransmittable({connection_close, _, _, _, _}) -> false;
 is_retransmittable({datagram, _}) -> false;
 is_retransmittable({datagram_with_length, _}) -> false;
 is_retransmittable(_) -> true.
+
+ms_to_us(Ms) -> Ms * 1000.
+
+us_to_ms_ceil(Us) -> (Us + 999) div 1000.

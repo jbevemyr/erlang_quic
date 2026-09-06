@@ -20,6 +20,7 @@
 -module(quic_pacing_burst_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("quic.hrl").
 
 -define(MDS, 1200).
 %% Larger than any burst under test, so the answer is bucket-limited.
@@ -58,8 +59,11 @@ rate(Cwnd, RttMs) ->
     max(1, (Cwnd * 1250) div (RttMs * 1000)).
 
 paced(Cwnd, RttMs) ->
+    paced_us(Cwnd, RttMs * 1000).
+
+paced_us(Cwnd, RttUs) ->
     State = quic_cc_newreno:new(#{max_datagram_size => ?MDS, initial_window => Cwnd}),
-    quic_cc_newreno:update_pacing_rate(State, RttMs).
+    quic_cc_newreno:update_pacing_rate(State, RttUs).
 
 %%====================================================================
 %% Baseline
@@ -130,18 +134,13 @@ update_mtu_keeps_the_floor_at_low_rates_test() ->
 %% Degenerate input
 %%====================================================================
 
-zero_rtt_paces_as_one_millisecond_test() ->
-    %% RTT samples are whole milliseconds, so a sub-millisecond link
-    %% reports 0. Treating that as "no RTT yet" froze the pacing rate at
-    %% its handshake-time value while cwnd kept growing. The rate is
-    %% computed as for a 1 ms RTT instead, so it keeps tracking cwnd.
+zero_rtt_paces_as_the_floor_test() ->
+    %% A zero or tiny sample (coarse clock, loopback) is paced as the
+    %% 100 µs floor: the rate keeps tracking cwnd instead of freezing,
+    %% and the division stays defined.
     Small = 12000,
     Large = 4000000,
-    ?assertEqual(
-        max(12 * ?MDS, 2 * rate(Small, 1)),
-        burst_ceiling(paced(Small, 0))
-    ),
-    ?assertEqual(
-        max(12 * ?MDS, 2 * rate(Large, 1)),
-        burst_ceiling(paced(Large, 0))
-    ).
+    FloorRate = fun(Cwnd) -> (Cwnd * 1250) div ?PACING_MIN_RTT_US end,
+    ?assertEqual(max(12 * ?MDS, 2 * FloorRate(Small)), burst_ceiling(paced_us(Small, 0))),
+    ?assertEqual(max(12 * ?MDS, 2 * FloorRate(Large)), burst_ceiling(paced_us(Large, 0))),
+    ?assertEqual(burst_ceiling(paced_us(Large, 0)), burst_ceiling(paced_us(Large, 30))).

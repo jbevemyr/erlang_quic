@@ -184,7 +184,7 @@ rtt_variation_test() ->
         fun({PN, RTT}, S) ->
             S1 = quic_loss:on_packet_sent(S, PN, 100, true),
             timer:sleep(1),
-            Now = erlang:monotonic_time(millisecond),
+            Now = erlang:monotonic_time(microsecond),
             AckFrame = {ack, PN, RTT, 0, []},
             {S2, _, _, _} = quic_loss:on_ack_received(S1, AckFrame, Now),
             S2
