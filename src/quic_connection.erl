@@ -11381,7 +11381,10 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
     %% confirmation it could not even decrypt it. RFC 9002 Section 7
     %% exempts it from the congestion window, which is what stops a
     %% blocked connection deadlocking on its own.
-    Probing = send_probe_packet(Space, State1#state{hs = (State1#state.hs)#hs{hs_probe = true}}),
+    {ProbeSpace, State1a} = probe_space(Space, State1),
+    Probing = send_probe_packet(ProbeSpace, State1a#state{
+        hs = (State1a#state.hs)#hs{hs_probe = true}
+    }),
     State2 = Probing#state{hs = (Probing#state.hs)#hs{hs_probe = false}},
 
     %% Probes use the control allowance, so retry any CC-deferred control
@@ -11394,6 +11397,16 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
 
     %% Set new PTO timer
     set_pto_timer(State3).
+
+%% RFC 9002 Section 6.2.2.1: a client with Handshake keys probes with a
+%% Handshake packet, and sending one discards its Initial keys (RFC 9001
+%% Section 4.9.1).
+probe_space(
+    initial, #state{cfg = #conn_cfg{role = client}, hs = #hs{handshake_keys = Keys}} = State
+) when Keys =/= undefined ->
+    {handshake, discard_initial(State)};
+probe_space(Space, State) ->
+    {Space, State}.
 
 %% Send a probe packet for PTO
 %% PTO probes are allowed to use control_allowance per RFC 9002
