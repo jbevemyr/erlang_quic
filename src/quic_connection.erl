@@ -6432,6 +6432,7 @@ process_tls_message(
 
     case quic_tls:parse_encrypted_extensions(Body) of
         {ok, #{alpn := Alpn, transport_params := TP, early_data := EarlyDataInEE}} ->
+            ok = check_negotiated_alpn(Alpn, State),
             %% RFC 9001 §4.6.2: a client that offered 0-RTT (i.e. has
             %% derived early_keys from a session ticket) confirms
             %% acceptance by the presence of the empty `early_data'
@@ -7099,8 +7100,7 @@ do_server_client_hello_cont(
                 Exchange
         end,
 
-    %% Negotiate ALPN
-    ALPN = quic_tls_negotiation:negotiate_alpn(ClientALPN, (State#state.cfg)#conn_cfg.alpn_list),
+    ALPN = negotiate_alpn(ClientALPN, State),
 
     %% Build ServerHello. For PSK handshakes the ServerHello
     %% carries `selected_psk_identity'; for psk_ke it also
@@ -7214,6 +7214,27 @@ do_server_client_hello_cont(
             State2 = send_server_hello(ServerHello, State1),
             State3 = server_handshake_flight(Cipher, TranscriptHash, State2),
             maybe_emit_pending_close(State3)
+    end.
+
+%% RFC 9001 Section 8.1: with ALPN in use, a connection that negotiates
+%% no application protocol is closed. A server with no protocols
+%% configured agrees on one by other means.
+negotiate_alpn(_ClientALPN, #state{cfg = #conn_cfg{alpn_list = []}}) ->
+    undefined;
+negotiate_alpn(ClientALPN, #state{cfg = #conn_cfg{alpn_list = ALPNList}} = State) ->
+    case quic_tls_negotiation:negotiate_alpn(ClientALPN, ALPNList) of
+        undefined ->
+            alert_and_exit(?TLS_ALERT_NO_APPLICATION_PROTOCOL, State, no_application_protocol);
+        ALPN ->
+            ALPN
+    end.
+
+check_negotiated_alpn(_ALPN, #state{cfg = #conn_cfg{alpn_list = []}}) ->
+    ok;
+check_negotiated_alpn(ALPN, #state{cfg = #conn_cfg{alpn_list = ALPNList}} = State) ->
+    case lists:member(ALPN, ALPNList) of
+        true -> ok;
+        false -> alert_and_exit(?TLS_ALERT_NO_APPLICATION_PROTOCOL, State, no_application_protocol)
     end.
 
 %% @private Select the server cert/key for this handshake. With no
@@ -11015,6 +11036,7 @@ default_alert_phrase(?TLS_ALERT_UNKNOWN_PSK_IDENTITY) -> <<"unknown psk identity
 default_alert_phrase(?TLS_ALERT_BAD_CERTIFICATE) -> <<"bad certificate">>;
 default_alert_phrase(?TLS_ALERT_UNKNOWN_CA) -> <<"unknown ca">>;
 default_alert_phrase(?TLS_ALERT_CERTIFICATE_REQUIRED) -> <<"certificate required">>;
+default_alert_phrase(?TLS_ALERT_NO_APPLICATION_PROTOCOL) -> <<"no application protocol">>;
 default_alert_phrase(_) -> <<"tls alert">>.
 
 %% Normalise the `verify' option to a strict boolean. Accepts the
