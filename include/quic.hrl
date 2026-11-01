@@ -234,6 +234,7 @@
 -define(TLS_ALERT_DECRYPT_ERROR, 51).
 -define(TLS_ALERT_INTERNAL_ERROR, 80).
 -define(TLS_ALERT_UNKNOWN_PSK_IDENTITY, 115).
+-define(TLS_ALERT_MISSING_EXTENSION, 109).
 
 %%====================================================================
 %% PSK offer record (client-side, fed into ClientHello PSK builder)

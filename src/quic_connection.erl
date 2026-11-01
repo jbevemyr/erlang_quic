@@ -6431,7 +6431,8 @@ process_tls_message(
         end,
 
     case quic_tls:parse_encrypted_extensions(Body) of
-        {ok, #{alpn := Alpn, transport_params := TP, early_data := EarlyDataInEE}} ->
+        {ok, #{alpn := Alpn, early_data := EarlyDataInEE} = EE} ->
+            TP = peer_transport_params(EE),
             %% RFC 9001 §4.6.2: a client that offered 0-RTT (i.e. has
             %% derived early_keys from a session ticket) confirms
             %% acceptance by the presence of the empty `early_data'
@@ -7210,7 +7211,7 @@ do_server_client_hello_cont(
                     negotiated_scheme = CVScheme
                 }
             },
-            State1 = apply_peer_transport_params(TP, State0b),
+            State1 = apply_peer_transport_params(peer_transport_params(ClientHelloInfo), State0b),
             State2 = send_server_hello(ServerHello, State1),
             State3 = server_handshake_flight(Cipher, TranscriptHash, State2),
             maybe_emit_pending_close(State3)
@@ -13280,9 +13281,12 @@ validate_initial_scid(TransportParams, CurrentDCID, RetryReceived, RetrySCID) ->
             {error, {initial_scid_mismatch, expected, CurrentDCID, got, Other}}
     end.
 
-validate_retry_scid(_TransportParams, false, _RetrySCID) ->
+validate_retry_scid(TransportParams, false, _RetrySCID) ->
     %% No Retry received - server MUST NOT include retry_source_connection_id
-    ok;
+    case maps:is_key(retry_scid, TransportParams) of
+        true -> {error, retry_scid_without_retry};
+        false -> ok
+    end;
 validate_retry_scid(TransportParams, true, RetrySCID) ->
     %% Retry was received - server MUST include matching retry_source_connection_id
     case maps:get(retry_scid, TransportParams, undefined) of
@@ -13298,6 +13302,18 @@ validate_retry_scid(TransportParams, true, RetrySCID) ->
 %% Extracts flow control limits, stream limits, and CID limit from peer's transport params.
 %% RFC 9000 Section 7.4: Transport parameters are applied after the handshake completes.
 %% RFC 9000 Section 7.3: Validates connection ID parameters before applying.
+apply_peer_transport_params(missing, State) ->
+    %% RFC 9001 Section 8.2: error 0x016d, a TLS missing_extension alert
+    State#state{
+        close_reason =
+            {pending_close, transport, ?QUIC_CRYPTO_ERROR_BASE + ?TLS_ALERT_MISSING_EXTENSION,
+                <<"missing quic_transport_parameters">>}
+    };
+apply_peer_transport_params({error, Reason}, State) ->
+    State#state{
+        close_reason =
+            {pending_close, transport, ?QUIC_TRANSPORT_PARAMETER_ERROR, tp_reason_to_binary(Reason)}
+    };
 apply_peer_transport_params(TransportParams, State) ->
     case validate_peer_transport_params(TransportParams, State) of
         ok ->
@@ -13317,6 +13333,14 @@ apply_peer_transport_params(TransportParams, State) ->
                 close_reason =
                     {pending_close, transport, ?QUIC_TRANSPORT_PARAMETER_ERROR, ReasonBin}
             }
+    end.
+
+%% The peer's transport parameters from a parsed ClientHello or
+%% EncryptedExtensions, or why there are none.
+peer_transport_params(Info) ->
+    case maps:get(transport_params_status, Info, ok) of
+        ok -> maps:get(transport_params, Info, #{});
+        Failed -> Failed
     end.
 
 %% Run all peer-transport-parameter validation checks: connection-id params,
