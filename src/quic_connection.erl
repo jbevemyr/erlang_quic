@@ -4621,10 +4621,37 @@ handle_packet_loop(Data, State) ->
                 },
                 ?QUIC_LOG_META
             ),
-            %% Re-enable socket
-            maybe_reenable_socket(State),
-            State
+            handle_packet_loop(next_coalesced_packet(Data), State)
     end.
+
+%% RFC 9000 Section 12.2: the packets coalesced after one that cannot be
+%% processed must still be processed.
+next_coalesced_packet(Data) ->
+    try
+        skip_long_header_packet(Data)
+    catch
+        error:_ -> <<>>;
+        throw:_ -> <<>>
+    end.
+
+skip_long_header_packet(
+    <<1:1, _:1, TypeBits:2, _:4, Version:32, DCIDLen, _:DCIDLen/binary, SCIDLen, _:SCIDLen/binary,
+        Rest0/binary>>
+) when Version =/= 0 ->
+    skip_long_header_body(quic_packet:bits_to_type(TypeBits, Version), Rest0);
+skip_long_header_packet(_) ->
+    <<>>.
+
+skip_long_header_body(retry, _) ->
+    <<>>;
+skip_long_header_body(initial, Rest0) ->
+    {TokenLen, Rest1} = quic_varint:decode(Rest0),
+    <<_:TokenLen/binary, Rest/binary>> = Rest1,
+    skip_long_header_body(handshake, Rest);
+skip_long_header_body(_, Rest) ->
+    {Len, Packet} = quic_varint:decode(Rest),
+    <<_:Len/binary, Next/binary>> = Packet,
+    Next.
 
 binhex(Bin) when is_binary(Bin) -> binary:encode_hex(Bin);
 binhex(Other) -> Other.
