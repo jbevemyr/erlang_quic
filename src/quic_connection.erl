@@ -780,7 +780,7 @@ init({server, Opts}) ->
             max_udp_payload_size_local = maps:get(max_udp_payload_size, Opts, undefined),
             max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
             datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
-            spin_bit_enabled = maps:get(spin_bit, Opts, true),
+            spin_bit_enabled = spin_bit_enabled(Opts),
             stateless_reset_secret = maps:get(reset_secret, Opts, undefined),
             retry_scid_for_tp = maps:get(retry_scid, Opts, undefined),
             reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
@@ -1218,7 +1218,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
             max_udp_payload_size_local = maps:get(max_udp_payload_size, Opts, undefined),
             max_datagram_frame_size_local = maps:get(max_datagram_frame_size, Opts, 0),
             datagram_recv_queue_len = maps:get(datagram_recv_queue_len, Opts, infinity),
-            spin_bit_enabled = maps:get(spin_bit, Opts, true),
+            spin_bit_enabled = spin_bit_enabled(Opts),
             stateless_reset_secret = maps:get(reset_secret, Opts, undefined),
             reset_stream_at_enabled = maps:get(reset_stream_at, Opts, false),
             idle_timeout = IdleTimeoutClient,
@@ -4166,8 +4166,8 @@ fold_opened(Results, State) ->
                     SpinOut =
                         case (State#state.cfg)#conn_cfg.spin_bit_enabled of
                             false -> State#state.spin_outgoing;
-                            true when (State#state.cfg)#conn_cfg.role =:= client -> SpinRecv;
-                            true -> 1 - SpinRecv
+                            true when (State#state.cfg)#conn_cfg.role =:= client -> 1 - SpinRecv;
+                            true -> SpinRecv
                         end,
                     NewPNSpace = PNSpace#pn_space{
                         largest_recv = LastPN,
@@ -9535,6 +9535,11 @@ finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = false}} = State) -
 %% against it historically.
 -define(PACKET_OVERHEAD, 50).
 
+%% RFC 9000 Section 17.4: the spin bit is disabled on at least one
+%% connection in 16, even where it is allowed.
+spin_bit_enabled(Opts) ->
+    maps:get(spin_bit, Opts, true) andalso rand:uniform(16) > 1.
+
 %% Build the short-header first byte, folding in the outgoing spin
 %% bit (RFC 9000 §17.4) when enabled. Bit layout:
 %%   bit 7 = 0        (fixed header form)
@@ -9566,8 +9571,8 @@ record_app_recv(FirstByte, PN, #state{pn_app = PNSpace} = State, Now) ->
                 Out =
                     case (State#state.cfg)#conn_cfg.spin_bit_enabled of
                         false -> State#state.spin_outgoing;
-                        true when (State#state.cfg)#conn_cfg.role =:= client -> R;
-                        true -> 1 - R
+                        true when (State#state.cfg)#conn_cfg.role =:= client -> 1 - R;
+                        true -> R
                     end,
                 {R, PN, Out};
             false ->
