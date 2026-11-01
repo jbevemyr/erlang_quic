@@ -5632,12 +5632,14 @@ process_frame(
                             NewStream = new_peer_stream(StreamId, State),
                             NewStreams = maps:put(
                                 StreamId,
-                                NewStream#stream_state{state = reset, final_size = FinalSize},
+                                NewStream#stream_state{
+                                    state = reset, final_size = FinalSize, recv_done = true
+                                },
                                 Streams
                             ),
                             StateFl = flush_pending_delivery(State),
                             Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                            StateFl#state{streams = NewStreams}
+                            maybe_reclaim_stream(StreamId, StateFl#state{streams = NewStreams})
                     end
             end
     end;
