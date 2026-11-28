@@ -68,6 +68,9 @@
 %% Paths a server keeps for addresses that probed it.
 -define(MAX_PROBED_PATHS, 4).
 
+%% Delay from connected to the one-off fullsweep of the handshake garbage.
+-define(SETTLE_GC_MS, 5000).
+
 %% How long a hand_over/3 waits for the old owner's events.
 -define(HAND_OVER_TIMEOUT, 5000).
 
@@ -1911,7 +1914,10 @@ connected(
     %% Everything queued above (pending data, NEW_TOKEN, the first PMTU
     %% probe) sits in the send batch; without a flush here it would
     %% only leave with the next event on this connection.
-    {keep_state, flush_event(State5, event), [{{timeout, handshake_deadline}, cancel}]};
+    {keep_state, flush_event(State5, event), [
+        {{timeout, handshake_deadline}, cancel},
+        {{timeout, settle_gc}, ?SETTLE_GC_MS, collect}
+    ]};
 connected({call, From}, get_ref, #state{cfg = #conn_cfg{conn_ref = Ref}} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 connected({call, From}, get_state, State) ->
@@ -2699,6 +2705,11 @@ handle_common_event(
 handle_common_event(info, {timeout, _StaleRef, prev_keys_retire_timeout}, _StateName, State) ->
     %% Stale retirement timer (ref doesn't match, or no deadline armed)
     {keep_state, State};
+%% One fullsweep once the post-handshake traffic (tickets, HANDSHAKE_DONE)
+%% has settled, so that a connection with hibernate_after => infinity does
+%% not keep the handshake garbage for its lifetime.
+handle_common_event({timeout, settle_gc}, collect, _StateName, State) ->
+    {keep_state, State, [hibernate]};
 %% RFC 9000 Section 10.1: a handshake still running at its deadline is closed, silently if idle.
 handle_common_event({timeout, handshake_deadline}, expired, StateName, State) when
     StateName =:= idle orelse StateName =:= handshaking

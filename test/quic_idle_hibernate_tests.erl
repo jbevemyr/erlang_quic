@@ -62,6 +62,18 @@ reductions(Pid) ->
 infinity_passes_no_hibernate_after_test() ->
     ?assertEqual([], quic_connection:statem_opts(#{hibernate_after => infinity})).
 
+%% Without hibernate_after the process still collects once, after the
+%% post-handshake traffic has settled, so the handshake garbage is not
+%% pinned for the life of the connection.
+handshake_garbage_is_collected_without_hibernate_after_test_() ->
+    {timeout, 60, fun() ->
+        with_connection(#{hibernate_after => infinity}, fun(Conn) ->
+            timer:sleep(6000),
+            ?assert(wait_until_quiet(Conn, 30000), "connection never went idle"),
+            ?assert(heap_words(Conn) * erlang:system_info(wordsize) < 32 * 1024)
+        end)
+    end}.
+
 explicit_hibernate_after_is_passed_through_test() ->
     ?assertEqual(
         [{hibernate_after, 200}], quic_connection:statem_opts(#{hibernate_after => 200})

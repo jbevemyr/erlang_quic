@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- A connection runs one full garbage collection five seconds after the
+  handshake, also with `hibernate_after => infinity`. The handshake
+  leaves 60 to 170 KiB of garbage on the connection process, and a
+  connection that never hibernates kept it for as long as it lived.
+  With `infinity` an idle connection's heap is now a few KiB.
+
 ## [3.3.2] - 2026-11-23
 
 ### Added
